@@ -5,8 +5,18 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.options.BoundConfigurable
 import com.intellij.openapi.ui.DialogPanel
+import com.intellij.openapi.progress.ProcessCanceledException
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.ui.ComboBox
+import com.intellij.openapi.util.ThrowableComputable
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.SimpleListCellRenderer
+import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
+import com.intellij.ui.components.JBTextField
+import com.intellij.util.ui.UIUtil
+import ir.arvanai.api.ArvanClient
+import javax.swing.DefaultComboBoxModel
 import com.intellij.ui.dsl.builder.AlignX
 import com.intellij.ui.dsl.builder.bindIntText
 import com.intellij.ui.dsl.builder.bindItem
@@ -14,13 +24,56 @@ import com.intellij.ui.dsl.builder.bindSelected
 import com.intellij.ui.dsl.builder.bindText
 import com.intellij.ui.dsl.builder.panel
 import ir.arvanai.I18n.tr
-import ir.arvanai.ide.AgentSetup
+import ir.arvanai.ide.GraphifySetup
 
 class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
 
     private val s get() = ArvanAiSettings.get()
     private val keyField = JBPasswordField()
     private var removeKey = false
+    private lateinit var baseUrlField: JBTextField
+    private val modelCombo = ComboBox<String>().apply { isEditable = true }
+    private val modelStatus = JBLabel().apply {
+        componentStyle = UIUtil.ComponentStyle.SMALL
+        foreground = UIUtil.getContextHelpForeground()
+    }
+    /** Models fetched while this page is open; saved on apply. */
+    private var fetchedModels: List<String>? = null
+
+    /** What is in the model box, including text typed but not committed yet. */
+    private fun modelText(): String =
+        ((modelCombo.editor.item as? String) ?: (modelCombo.selectedItem as? String)).orEmpty().trim()
+
+    private fun fillModels(models: List<String>, selected: String) {
+        modelCombo.model = DefaultComboBoxModel(models.toTypedArray())
+        modelCombo.selectedItem = selected
+        modelCombo.editor.item = selected
+        modelStatus.text = if (models.isEmpty()) {
+            tr("Type a model name, or press Fetch Models to load the list from ArvanCloud.",
+                "نام مدل را بنویسید یا «دریافت مدل‌ها» را بزنید تا فهرست از ابرآروان خوانده شود.")
+        } else {
+            tr("${models.size} chat models available for this API key.", "${models.size} مدل چت برای این کلید API در دسترس است.")
+        }
+    }
+
+    private fun fetchModels() {
+        val typedKey = String(keyField.password).trim()
+        val base = baseUrlField.text.trim()
+        try {
+            val models = ProgressManager.getInstance().runProcessWithProgressSynchronously(
+                ThrowableComputable<List<String>, Exception> { ArvanClient.listModels(typedKey, base) },
+                tr("Fetching models from ArvanCloud…", "دریافت مدل‌ها از ابرآروان…"),
+                true,
+                null,
+            )
+            fetchedModels = models
+            fillModels(models, modelText())
+        } catch (e: ArvanClient.ApiException) {
+            modelStatus.text = "<html>" + StringUtil.escapeXmlEntities(e.message.orEmpty()).replace("\n", "<br>") + "</html>"
+        } catch (e: ProcessCanceledException) {
+            // cancelled by the user
+        }
+    }
 
     override fun createPanel(): DialogPanel = panel {
         group(tr("Connection to ArvanCloud AI", "اتصال به هوش مصنوعی آروان‌کلود")) {
@@ -39,15 +92,18 @@ class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
                     .bindSelected({ removeKey }, { removeKey = it })
             }
             row(tr("Base URL:", "نشانی پایه:")) {
-                textField()
+                baseUrlField = textField()
                     .align(AlignX.FILL)
                     .bindText(s::baseUrl)
                     .comment(tr("Requests go to <base URL>/chat/completions", "درخواست‌ها به <نشانی پایه>/chat/completions فرستاده می‌شوند"))
+                    .component
             }
             row(tr("Model:", "مدل:")) {
-                textField()
-                    .bindText(s::model)
-                    .comment(tr("Example: GPT-5.2-Pro", "مثال: GPT-5.2-Pro"))
+                cell(modelCombo).resizableColumn().align(AlignX.FILL)
+                button(tr("Fetch Models", "دریافت مدل‌ها")) { fetchModels() }
+            }
+            row("") {
+                cell(modelStatus)
             }
             row(tr("Max completion tokens:", "حداکثر توکن پاسخ:")) {
                 intTextField(1..200_000).bindIntText(s::maxCompletionTokens)
@@ -81,6 +137,12 @@ class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
                 checkBox(tr("Run shell commands without asking", "اجرای دستورهای shell بدون پرسیدن"))
                     .bindSelected(s::autoApproveCommands)
             }
+            row {
+                checkBox(tr("Use MCP servers (.arvanai/mcp.json in the project, ~/.arvanai/mcp.json)", "استفاده از سرورهای MCP (.arvanai/mcp.json پروژه، ~/.arvanai/mcp.json)"))
+                    .bindSelected(s::mcpEnabled)
+                    .comment(tr("Project servers run only after you allow them. Type /mcp in the chat to see their status.",
+                        "سرورهای پروژه فقط پس از اجازهٔ شما اجرا می‌شوند. برای دیدن وضعیت، در چت /mcp بنویسید."))
+            }
             row(tr("Max steps per message:", "حداکثر گام در هر پیام:")) {
                 intTextField(1..200).bindIntText(s::maxAgentSteps)
             }
@@ -96,29 +158,15 @@ class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
                     ))
             }
         }
-        group(tr("Terminal Agent (Aider)", "ایجنت ترمینال (Aider)")) {
-            row(tr("Agent model:", "مدل ایجنت:")) {
-                textField()
-                    .bindText(s::agentModel)
-                    .comment(
-                        tr(
-                            "Empty = same as the chat model. During an internet outage, use a model hosted inside Iran.",
-                            "خالی = همان مدل چت. هنگام قطعی اینترنت، مدلی را بگذارید که داخل ایران میزبانی می‌شود.",
-                        )
-                    )
-            }
+        group(tr("Code Graph (graphify, optional)", "گراف کد (graphify، اختیاری)")) {
             row {
-                checkBox(tr("Offer the agent setup when opening a project", "پیشنهاد راه‌اندازی ایجنت هنگام باز کردن پروژه"))
-                    .bindSelected(s::agentSetupPrompt)
-            }
-            row {
-                button(tr("Set Up Agent for Current Project", "راه‌اندازی ایجنت برای پروژهٔ فعلی")) {
+                button(tr("Build Code Graph for Current Project", "ساخت گراف کد برای پروژهٔ فعلی")) {
                     val project = ProjectUtil.getActiveProject() ?: ProjectManager.getInstance().openProjects.firstOrNull()
-                    if (project != null) AgentSetup.run(project)
+                    if (project != null) GraphifySetup.run(project)
                 }.comment(
                     tr(
-                        "Installs Aider and graphify with uv if missing (needs internet), writes .aider.conf.yml, and builds the code graph. Open it with Tools › ArvanAi: Open Agent.",
-                        "اگر Aider و graphify نصب نباشند با uv نصب می‌کند (نیاز به اینترنت)، .aider.conf.yml را می‌سازد و گراف کد را تولید می‌کند. اجرا: Tools › ArvanAi: باز کردن ایجنت.",
+                        "The chat agent already finds symbols, references and file relations with the IDE's index. graphify builds a code graph that is used when you ask with /graphify <question>. graphify and the graph live in the IDE's own folder (installed with uv on first use, needs internet); nothing in the project or in other tools is changed.",
+                        "ایجنت چت خودش با index خود IDE نمادها، ارجاع‌ها و رابطهٔ فایل‌ها را پیدا می‌کند. graphify یک گراف کد می‌سازد که با ‎/graphify <سؤال> استفاده می‌شود. خود graphify و گراف در پوشهٔ مخصوص IDE نگه‌داری می‌شوند (بار اول با uv نصب می‌شود و اینترنت لازم است). در پروژه و ابزارهای دیگر چیزی تغییر نمی‌کند.",
                     )
                 )
             }
@@ -174,10 +222,16 @@ class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
         }
     }
 
-    override fun isModified(): Boolean = super.isModified() || keyField.password.isNotEmpty()
+    override fun isModified(): Boolean =
+        super.isModified() || keyField.password.isNotEmpty() ||
+            modelText().let { it.isNotEmpty() && it != s.model } ||
+            fetchedModels.let { it != null && it != s.knownModels }
 
     override fun apply() {
         super.apply()
+        modelText().takeIf { it.isNotEmpty() }?.let { s.model = it }
+        fetchedModels?.let { s.knownModels = it.toMutableList() }
+        fetchedModels = null
         val typed = String(keyField.password).trim()
         val remove = removeKey
         keyField.text = ""
@@ -195,6 +249,8 @@ class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
         super.reset()
         keyField.text = ""
         removeKey = false
+        fetchedModels = null
+        fillModels(s.knownModels.toList(), s.model)
     }
 
     companion object {

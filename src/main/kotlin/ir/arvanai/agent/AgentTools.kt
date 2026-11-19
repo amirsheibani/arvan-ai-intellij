@@ -14,6 +14,7 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.util.EnvironmentUtil
 import ir.arvanai.chat.ToolCall
+import ir.arvanai.ide.GraphifySetup
 import java.io.File
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.FileSystems
@@ -26,7 +27,7 @@ import java.util.concurrent.TimeUnit
  */
 class AgentTools(private val project: Project) {
 
-    enum class Kind { READ, EDIT, COMMAND }
+    enum class Kind { READ, EDIT, COMMAND, MCP }
 
     /** Shared with the running tool so Stop can kill a command. */
     class RunContext {
@@ -55,6 +56,13 @@ class AgentTools(private val project: Project) {
         val preview: String?,
         /** For edits: (current text, text after the change) of the whole file, for the IDE diff viewer. */
         val proposed: (() -> Pair<String, String>?)? = null,
+        /** Key for approval ("edit", "command", "mcp:<server>"); null = runs without asking. */
+        val approvalKey: String? = when (kind) {
+            Kind.READ -> null
+            Kind.EDIT -> "edit"
+            Kind.COMMAND -> "command"
+            Kind.MCP -> "mcp"
+        },
         val run: (RunContext) -> Result,
     )
 
@@ -62,7 +70,53 @@ class AgentTools(private val project: Project) {
 
     // ---------------------------------------------------------------- definitions
 
-    fun definitions(): JsonArray = JsonArray().apply {
+    /**
+     * Tool definitions; in [planMode] only read-only tools plus exit_plan_mode.
+     * [graphify]: the user asked for graphify (`/graphify <question>`), so the `graphify` tool is offered too.
+     */
+    fun definitions(planMode: Boolean, graphify: Boolean = false): JsonArray = JsonArray().apply {
+        if (graphify) {
+            add(fn("graphify", "Query the project's graphify knowledge graph, which the user asked you to use " +
+                    "for this message. mode \"query\": a question in natural language; \"explain\": one concept or symbol; " +
+                    "\"path\": how two concepts are connected (text = from, to = to). Returns a scoped subgraph.",
+                props = mapOf(
+                    "mode" to JsonObject().apply {
+                        addProperty("type", "string")
+                        add("enum", JsonArray().apply { add("query"); add("explain"); add("path") })
+                    },
+                    "text" to str("The question, the concept, or (for path) the first concept."),
+                    "to" to str("For mode \"path\" only: the second concept."),
+                ), required = listOf("mode", "text")))
+        }
+        add(fn("todo_write", "Create or update the task list for the current work. Use it for tasks with 3 or more steps: " +
+                "send the whole list every time, keep exactly one task in_progress while working, and mark tasks completed " +
+                "as soon as they are done. Skip it for simple one-step requests.",
+            props = mapOf("todos" to JsonObject().apply {
+                addProperty("type", "array")
+                addProperty("description", "The complete task list.")
+                add("items", JsonObject().apply {
+                    addProperty("type", "object")
+                    add("properties", JsonObject().apply {
+                        add("content", str("What to do, short and imperative."))
+                        add("status", JsonObject().apply {
+                            addProperty("type", "string")
+                            add("enum", JsonArray().apply { add("pending"); add("in_progress"); add("completed") })
+                        })
+                    })
+                    add("required", JsonArray().apply { add("content"); add("status") })
+                })
+            }), required = listOf("todos")))
+        if (planMode) {
+            add(fn("exit_plan_mode", "Present your implementation plan to the user for approval and leave plan mode. " +
+                    "Call it only when the plan is complete. If the user approves, you can then edit files and run commands.",
+                props = mapOf("plan" to str("The plan in Markdown: goal, files to change and how, steps, and how to verify.")),
+                required = listOf("plan")))
+        }
+        readOnlyDefinitions().forEach { add(it) }
+        if (!planMode) writeDefinitions().forEach { add(it) }
+    }
+
+    private fun readOnlyDefinitions(): JsonArray = JsonArray().apply {
         add(fn("list_dir", "List the entries of a directory in the project (directories end with /).",
             props = mapOf("path" to str("Directory relative to the project root. Default: \".\"")), required = emptyList()))
         add(fn("glob", "Find files whose project-relative path matches a glob pattern, e.g. \"**/*.kt\" or \"src/**/Chat*.js\". " +
@@ -82,6 +136,36 @@ class AgentTools(private val project: Project) {
                 "offset" to int("1-based line to start at. Default: 1."),
                 "limit" to int("Number of lines to read. Default: $DEFAULT_READ_LINES."),
             ), required = listOf("path")))
+        // Code navigation on the IDE's index: prefer these to grep for code questions.
+        add(fn("find_symbol", "Find where classes, functions, methods, fields etc. are declared, by name (exact matches " +
+                "first, then names containing the text). Uses the IDE's code index, so it ignores comments and strings. " +
+                "Prefer it to grep when looking for a declaration.",
+            props = mapOf("name" to str("Symbol name or part of it, e.g. \"ChatPanel\" or \"sendMessage\".")),
+            required = listOf("name")))
+        add(fn("file_outline", "List the declarations of a file (classes, functions, fields …) as a tree with line numbers. " +
+                "Cheaper than reading a large file; read only the parts you need afterwards.",
+            props = mapOf("path" to str("File path relative to the project root.")), required = listOf("path")))
+        add(fn("find_references", "Find every place in the project that uses a symbol (call sites, imports, overrides …), " +
+                "resolved by the IDE, not by text. Give the file and line where the name appears (its declaration or any use).",
+            props = mapOf(
+                "path" to str("File where the name appears."),
+                "line" to int("1-based line where the name appears."),
+                "symbol" to str("The name as written in the code, e.g. \"sendMessage\"."),
+            ), required = listOf("path", "line", "symbol")))
+        add(fn("go_to_definition", "Resolve a name used in the code to its declaration (file:line and that line), " +
+                "including library and SDK classes.",
+            props = mapOf(
+                "path" to str("File where the name is used."),
+                "line" to int("1-based line where the name is used."),
+                "symbol" to str("The name as written in the code."),
+            ), required = listOf("path", "line", "symbol")))
+        add(fn("file_relations", "Show how a file is connected to the rest of the project: the project files it uses " +
+                "and the files that use its declarations, with reference counts. Use it to see the impact of a change " +
+                "or to understand a module.",
+            props = mapOf("path" to str("File path relative to the project root.")), required = listOf("path")))
+    }
+
+    private fun writeDefinitions(): JsonArray = JsonArray().apply {
         add(fn("edit_file", "Replace an exact piece of text in a file. old_string must match the file exactly (whitespace " +
                 "included, without line-number prefixes) and be unique unless replace_all is true. Read the file first.",
             props = mapOf(
@@ -156,6 +240,39 @@ class AgentTools(private val project: Project) {
                 val p = s("path") ?: return failed(call, "Missing argument: path")
                 Prepared(call, Kind.READ, "Read", p, null) { readFile(p, i("offset") ?: 1, i("limit") ?: DEFAULT_READ_LINES) }
             }
+            "find_symbol" -> {
+                val name = s("name")?.takeIf { it.isNotBlank() } ?: return failed(call, "Missing argument: name")
+                Prepared(call, Kind.READ, "Symbol", name, null) { ctx -> safe { code.findSymbol(name, ctx) } }
+            }
+            "file_outline" -> {
+                val p = s("path") ?: return failed(call, "Missing argument: path")
+                Prepared(call, Kind.READ, "Outline", p, null) { ctx -> onFile(p) { code.outline(it, ctx) } }
+            }
+            "find_references", "go_to_definition" -> {
+                val p = s("path") ?: return failed(call, "Missing argument: path")
+                val sym = s("symbol")?.trim()?.takeIf { it.isNotEmpty() } ?: return failed(call, "Missing argument: symbol")
+                val line = i("line") ?: 0
+                val refs = call.name == "find_references"
+                Prepared(call, Kind.READ, if (refs) "References" else "Definition", "$sym  in $p:$line", null) { ctx ->
+                    onFile(p) { if (refs) code.findReferences(it, line, sym, ctx) else code.goToDefinition(it, line, sym, ctx) }
+                }
+            }
+            "graphify" -> {
+                val mode = s("mode") ?: "query"
+                val text = s("text")?.trim()?.takeIf { it.isNotEmpty() } ?: return failed(call, "Missing argument: text")
+                val args = GraphifySetup.toolArgs(mode, text, s("to")?.trim())
+                    ?: return failed(call, "Invalid arguments: mode must be query, explain or path (path needs \"to\").")
+                Prepared(call, Kind.READ, "Graphify", "$mode: $text" + (s("to")?.let { " → $it" } ?: ""), null) {
+                    val (ok, out) = GraphifySetup.query(project, args)
+                    val shown = out.take(MAX_GRAPHIFY)
+                    Result(ok, if (out.length > MAX_GRAPHIFY) "$shown\n… (truncated)" else shown,
+                        if (ok) "${out.lines().size} lines" else "graphify failed")
+                }
+            }
+            "file_relations" -> {
+                val p = s("path") ?: return failed(call, "Missing argument: path")
+                Prepared(call, Kind.READ, "Relations", p, null) { ctx -> onFile(p) { code.relations(it, ctx) } }
+            }
             "edit_file" -> {
                 val p = s("path") ?: return failed(call, "Missing argument: path")
                 val old = s("old_string") ?: return failed(call, "Missing argument: old_string")
@@ -182,6 +299,27 @@ class AgentTools(private val project: Project) {
                 Prepared(call, Kind.COMMAND, "Bash", cmd, "$ $cmd") { runCommand(cmd, timeout, it) }
             }
             else -> failed(call, "Unknown tool: ${call.name}")
+        }
+    }
+
+    private val code by lazy { CodeTools(project, root) }
+
+    private fun CodeTools.Answer.toResult() = Result(ok, text, summary)
+
+    /** Runs a code query on a project file; index errors become a normal tool error for the model. */
+    private fun onFile(path: String, body: (File) -> CodeTools.Answer): Result {
+        val f = resolve(path) ?: return outside(path)
+        if (!f.isFile) return Result(false, "Error: file not found: $path", "File not found")
+        return safe { body(f) }
+    }
+
+    private fun safe(body: () -> CodeTools.Answer): Result {
+        return try {
+            body().toResult()
+        } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+            Result(false, "Error: the query was cancelled.", "Cancelled")
+        } catch (e: Exception) {
+            Result(false, "Error: code index query failed (${e.javaClass.simpleName}). Use grep instead.", "Index query failed")
         }
     }
 
@@ -466,5 +604,6 @@ class AgentTools(private val project: Project) {
         private const val MAX_TIMEOUT_S = 600
         private const val OUTPUT_HEAD = 10_000
         private const val OUTPUT_TAIL = 20_000
+        private const val MAX_GRAPHIFY = 30_000
     }
 }

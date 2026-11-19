@@ -70,7 +70,7 @@ object ArvanClient {
     private var cachedClient: HttpClient? = null
     private var cachedProxy: String = ""
 
-    /** One shared client; rebuilt only when the proxy setting changes. Also used by [LocalApiProxy]. */
+    /** One shared client; rebuilt only when the proxy setting changes. */
     @Synchronized
     internal fun client(): HttpClient {
         val proxy = ArvanAiSettings.get().httpsProxy.trim()
@@ -112,6 +112,62 @@ object ArvanClient {
             }
         }
         return handle
+    }
+
+    /** Thrown by [listModels]; [message] is ready to show to the user. */
+    class ApiException(message: String) : Exception(message)
+
+    /** Ids that are not chat models (embeddings, speech, image generation). */
+    private val NON_CHAT = Regex("(?i)embed|bge|whisper|transcribe|tts|image|dall-?e")
+
+    /**
+     * `GET {baseUrl}/models`: the chat models available to this API key, sorted by name.
+     * Blocking; call it off the EDT. Throws [ApiException] with a user-facing message.
+     * [apiKey] / [baseUrl] override the saved values (the settings page passes what is typed but not applied yet).
+     */
+    fun listModels(apiKey: String? = null, baseUrl: String? = null): List<String> {
+        val key = apiKey?.takeIf { it.isNotBlank() } ?: ApiKeyStore.get() ?: throw ApiException(
+            I18n.tr("No API key is set. Add it in Settings › Tools › ArvanAi.", "کلید API تنظیم نشده است. آن را در Settings › Tools › ArvanAi وارد کنید.")
+        )
+        val base = baseUrl?.takeIf { it.isNotBlank() } ?: ArvanAiSettings.get().baseUrl
+        val uri = try {
+            URI(base.trim().trimEnd('/') + "/models").also { require(it.scheme == "https" || it.scheme == "http") }
+        } catch (e: Exception) {
+            throw ApiException(I18n.tr("The base URL in Settings is not valid.", "نشانی پایه در تنظیمات معتبر نیست."))
+        }
+        val request = HttpRequest.newBuilder(uri)
+            .timeout(Duration.ofSeconds(30))
+            .header("Authorization", "apikey $key")
+            .header("Accept", "application/json")
+            .GET()
+            .build()
+        val response = try {
+            client().send(request, HttpResponse.BodyHandlers.ofString(UTF_8))
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw ApiException(describe(CancellationException()))
+        } catch (e: Exception) {
+            throw ApiException(describe(e))
+        }
+        val text = response.body().orEmpty()
+        val status = response.statusCode()
+        if (status !in 200..299) {
+            val type = response.headers().firstValue("Content-Type").orElse("?")
+            PluginLog.warn("api", "GET /models HTTP $status body=${plainText(text).take(300)}")
+            val detail = extractError(text).ifBlank { plainText(text).take(200) }
+            throw ApiException(httpError(status, detail, status == 403 && type.contains("html", ignoreCase = true)))
+        }
+        val data = try {
+            JsonParser.parseString(text).asJsonObject.getAsJsonArray("data")
+        } catch (e: Exception) {
+            null
+        } ?: throw ApiException(I18n.tr("The server returned an unreadable reply.", "پاسخ سرور قابل خواندن نبود."))
+        val ids = data.mapNotNull { (it as? JsonObject)?.get("id")?.takeIf { id -> id.isJsonPrimitive }?.asString?.trim() }
+            .filter { it.isNotEmpty() && !NON_CHAT.containsMatchIn(it) }
+            .distinct()
+            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+        PluginLog.info("api", "GET /models: ${data.size()} models, ${ids.size} chat models")
+        return ids
     }
 
     private fun messageJson(m: ChatMessage) = JsonObject().apply {

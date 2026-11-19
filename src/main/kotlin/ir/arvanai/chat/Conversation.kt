@@ -92,6 +92,23 @@ class Conversation {
         return out
     }
 
+    /** Copy of the stored messages (without the system prompt), for saving. */
+    @Synchronized
+    fun export(): List<ChatMessage> = ArrayList(turns)
+
+    /** Replaces the history with a saved one; dangling tool calls (run stopped mid-way) are answered. */
+    @Synchronized
+    fun restore(savedSummary: String?, messages: List<ChatMessage>) {
+        reset()
+        turns += messages
+        while (turns.isNotEmpty() && turns[0].role != "user") turns.removeAt(0)
+        summary = savedSummary?.takeIf { it.isNotBlank() }
+        closeDanglingToolCalls("Cancelled: the run ended before this tool call finished.")
+    }
+
+    @Synchronized
+    fun isEmpty() = turns.isEmpty() && summary == null
+
     // ---------------------------------------------------------------- compaction
 
     /** Records the prompt size the server reported for a request of [messages] (improves [estimateTokens]). */

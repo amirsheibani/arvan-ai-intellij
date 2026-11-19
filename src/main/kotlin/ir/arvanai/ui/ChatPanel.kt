@@ -44,11 +44,17 @@ import ir.arvanai.chat.ChatMessage
 import ir.arvanai.chat.Conversation
 import ir.arvanai.chat.ToolCall
 import ir.arvanai.chat.Prompts
+import ir.arvanai.chat.SessionStore
 import ir.arvanai.context.InstructionsImporter
 import ir.arvanai.context.ProjectInstructions
 import ir.arvanai.ide.GitInfo
+import ir.arvanai.ide.GraphifySetup
 import ir.arvanai.ide.ProjectFileSearch
 import ir.arvanai.ide.SelectionTracker
+import ir.arvanai.mcp.McpManager
+import ir.arvanai.mcp.McpServerConfig
+import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.ui.Messages
 import ir.arvanai.settings.ApiKeyStore
 import ir.arvanai.settings.ArvanAiSettings
 import org.cef.browser.CefBrowser
@@ -96,6 +102,14 @@ class ChatPanel(private val project: Project) : Disposable {
         @Volatile
         var steps = 0
         val usage = LongArray(3) // prompt, completion, total
+
+        /** Plan mode: read-only tools until the user approves the plan (exit_plan_mode). */
+        @Volatile
+        var plan = false
+
+        /** The user asked for graphify (`/graphify <question>`): the graphify tool is offered for this turn. */
+        @Volatile
+        var graphify = false
     }
 
     private val gson = Gson()
@@ -108,12 +122,23 @@ class ChatPanel(private val project: Project) : Disposable {
     private val lock = Any()
 
     private val conversations = ConcurrentHashMap<String, Conversation>()
+
+    /** The saved session behind a chat tab: its id and the transcript the page shows (for /resume). */
+    private class ChatSession(
+        val id: String = java.util.UUID.randomUUID().toString(),
+        var title: String = "",
+        val created: Long = System.currentTimeMillis(),
+        val transcript: MutableList<JsonObject> = ArrayList(),
+    )
+
+    private val sessions = ConcurrentHashMap<String, ChatSession>()
     private val turns = ConcurrentHashMap<String, Turn>()
     private val tracker = SelectionTracker.getInstance(project)
     private val agentTools by lazy { AgentTools(project) }
 
-    /** Tool kinds the user allowed for the rest of this IDE session ("Always allow"). */
-    private val sessionApproved: MutableSet<AgentTools.Kind> = ConcurrentHashMap.newKeySet()
+    /** Approval keys ("edit", "command", "mcp:<server>") the user allowed for the rest of this IDE session. */
+    private val sessionApproved: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val mcp by lazy { McpManager.getInstance(project) }
 
     /** Set when the server rejected the `tools` field; later requests are sent as plain chat. */
     @Volatile
@@ -217,18 +242,26 @@ class ChatPanel(private val project: Project) : Disposable {
             "send" -> {
                 val text = str("text")
                 if (text.isBlank() || text.length > MAX_INPUT_CHARS) return
-                sendMessage(chat, text, bool("shareContext", true), bool("expandRefs", true))
+                sendMessage(chat, text, bool("shareContext", true), bool("expandRefs", true), bool("plan", false))
             }
             "stop" -> stopTurn(chat)
             "toolDecision" -> turns[chat]?.approvals?.get(str("id"))?.complete(str("decision"))
             "showDiff" -> turns[chat]?.pendingEdits?.get(str("id"))?.let { p -> pooled { showDiff(p) } }
+            "listSessions" -> pooled { sendSessions(chat) }
+            "resumeSession" -> pooled { resumeSession(chat, str("id")) }
+            "deleteSession" -> pooled {
+                SessionStore.delete(project, str("id"))
+                sendSessions(chat)
+            }
             "clearChat" -> {
                 stopTurn(chat)
+                sessions.remove(chat)
                 conversations[chat]?.reset()
                 post("contextSize", chatJson(chat).apply { addProperty("tokens", 0); addProperty("limit", contextLimit()) })
             }
             "closeChat" -> {
                 stopTurn(chat)
+                sessions.remove(chat)
                 conversations.remove(chat)
             }
             "fileSearch" -> {
@@ -244,6 +277,17 @@ class ChatPanel(private val project: Project) : Disposable {
             }
             "recentFiles" -> ApplicationManager.getApplication().invokeLater { sendRecentFiles() }
             "setModel" -> str("value").trim().takeIf { MODEL_ID.matches(it) }?.let { ArvanAiSettings.get().model = it }
+            "fetchModels" -> pooled {
+                val reply = JsonObject()
+                try {
+                    val models = ArvanClient.listModels()
+                    ArvanAiSettings.get().knownModels = models.toMutableList()
+                    reply.add("items", gson.toJsonTree(models))
+                } catch (e: ArvanClient.ApiException) {
+                    reply.addProperty("error", e.message.orEmpty())
+                }
+                post("models", reply)
+            }
             "setAutoFollow" -> ArvanAiSettings.get().autoFollow = bool("value", true)
             "setLanguage" -> {
                 ArvanAiSettings.get().language = if (str("value") == "fa") "fa" else "en"
@@ -287,9 +331,9 @@ class ChatPanel(private val project: Project) : Disposable {
 
     // ---------------------------------------------------------------- chat turns
 
-    private fun sendMessage(chat: String, rawText: String, shareContext: Boolean, expandRefs: Boolean) {
+    private fun sendMessage(chat: String, rawText: String, shareContext: Boolean, expandRefs: Boolean, plan: Boolean) {
         val conv = conversation(chat)
-        val turn = Turn(chat)
+        val turn = Turn(chat).also { it.plan = plan }
         if (turns.putIfAbsent(chat, turn) != null) {
             post("error", chatJson(chat).apply { addProperty("text", I18n.tr("The previous reply is still running.", "پاسخ قبلی هنوز در حال اجراست.")) })
             return
@@ -298,23 +342,60 @@ class ChatPanel(private val project: Project) : Disposable {
         pooled(onFail = { finishTurn(turn) { post("error", chatJson(chat).apply { addProperty("text", I18n.tr("Could not send the message.", "ارسال پیام ناموفق بود.")) }) } }) {
             val s = ArvanAiSettings.get()
             val base = project.basePath
+            val session = sessions.getOrPut(chat) { ChatSession() }
+            if (session.title.isEmpty()) session.title = rawText.replace(Regex("\\s+"), " ").trim().take(80)
+            record(chat, JsonObject().apply {
+                addProperty("t", "user")
+                addProperty("text", rawText)
+            })
             val trimmed = rawText.trim()
             if (trimmed == "/compact" || trimmed.startsWith("/compact ") || trimmed.startsWith("/compact\n")) {
                 compactCommand(turn, conv, trimmed.removePrefix("/compact").trim())
                 return@pooled
             }
+            if (trimmed == "/mcp" || trimmed == "/mcp reload") {
+                mcpCommand(turn, reload = trimmed.endsWith("reload"))
+                return@pooled
+            }
+            // "/graphify" builds the graph; "/graphify <question>" answers with it (the tool is offered for this turn only).
+            var input = rawText
+            if (trimmed == "/graphify" || trimmed.startsWith("/graphify ") || trimmed.startsWith("/graphify\n")) {
+                val question = trimmed.removePrefix("/graphify").trim()
+                if (question.isEmpty() || question == "update") {
+                    graphifyBuildCommand(turn)
+                    return@pooled
+                }
+                if (!s.agentTools || toolsUnsupported) {
+                    finishTurn(turn) {
+                        chatNotice(chat, I18n.tr("/graphify needs the agent tools (Settings › Tools › ArvanAi › Chat Agent) and a model that supports tools.",
+                            "‏/graphify به ابزارهای ایجنت (Settings › Tools › ArvanAi › ایجنت چت) و مدلی که از ابزار پشتیبانی کند نیاز دارد."))
+                        post("done", chatJson(chat))
+                    }
+                    return@pooled
+                }
+                if (!GraphifySetup.hasGraph(project)) {
+                    finishTurn(turn) {
+                        chatNotice(chat, I18n.tr("This project has no code graph yet. Send /graphify to build it, then ask again.",
+                            "این پروژه هنوز گراف کد ندارد. اول /graphify را بفرستید تا ساخته شود، بعد دوباره بپرسید."))
+                        post("done", chatJson(chat))
+                    }
+                    return@pooled
+                }
+                turn.graphify = true
+                input = question
+            }
             // "/skill args" becomes the skill's instructions; other text keeps the IDE context.
-            var text = rawText
+            var text = input
             var isSkill = false
-            if (rawText.startsWith("/")) {
-                val name = rawText.substring(1).substringBefore(' ').substringBefore('\n')
-                val args = rawText.substring(1 + name.length).trim()
+            if (input.startsWith("/")) {
+                val name = input.substring(1).substringBefore(' ').substringBefore('\n')
+                val args = input.substring(1 + name.length).trim()
                 ProjectInstructions.expandSkill(base, name, args)?.let {
                     text = it
                     isSkill = true
                 }
             }
-            if (!isSkill && !rawText.startsWith("/")) {
+            if (!isSkill && !input.startsWith("/")) {
                 if (expandRefs) text = expandFileRefs(text)
                 if (shareContext) text = withIdeContext(text)
             }
@@ -338,12 +419,17 @@ class ChatPanel(private val project: Project) : Disposable {
         val chat = turn.chat
         turn.partial.setLength(0)
         turn.steps++
-        val system = buildSystemPrompt(useTools)
+        val tools = if (useTools) {
+            if (s.mcpEnabled) startMcp(chat)
+            if (turn.finished.get()) return
+            agentTools.definitions(turn.plan, turn.graphify).also { defs -> if (s.mcpEnabled) mcp.definitions(readOnlyOnly = turn.plan).forEach { defs.add(it) } }
+        } else null
+        val system = buildSystemPrompt(useTools, turn.plan, turn.graphify)
         if (s.autoCompact) maybeCompact(turn, conv, system)
         if (turn.finished.get()) return
         val messages = conv.snapshot(system)
         postContextSize(chat, conv, messages)
-        turn.handle = ArvanClient.send(messages, if (useTools) agentTools.definitions() else null, object : ArvanClient.Listener {
+        turn.handle = ArvanClient.send(messages, tools, object : ArvanClient.Listener {
             override fun onDelta(text: String) {
                 if (turn.finished.get()) return
                 turn.partial.append(text)
@@ -529,41 +615,37 @@ class ChatPanel(private val project: Project) : Disposable {
     /** Shows the call in the chat, asks for approval if needed, runs it and returns the text for the model. */
     private fun executeTool(turn: Turn, call: ToolCall): String {
         val chat = turn.chat
-        val p = agentTools.prepare(call)
+        when (call.name) {
+            "todo_write" -> return todoWrite(chat, call)
+            "exit_plan_mode" -> return exitPlanMode(turn, call)
+        }
+        val p = if (call.name.startsWith("mcp__")) mcp.prepare(call) else agentTools.prepare(call)
         post("toolStart", chatJson(chat).apply {
             addProperty("id", call.id)
             addProperty("title", p.title)
             addProperty("label", p.label)
         })
+        val writes = p.kind == AgentTools.Kind.EDIT || p.kind == AgentTools.Kind.COMMAND ||
+            (p.kind == AgentTools.Kind.MCP && !mcp.isReadOnly(call.name))
+        if (turn.plan && writes) {
+            toolEnd(chat, call.id, false, I18n.tr("Not allowed in plan mode", "در plan mode مجاز نیست"), null)
+            return "Error: plan mode is on, so files cannot be changed and commands cannot be run. Finish the plan and call exit_plan_mode."
+        }
         val s = ArvanAiSettings.get()
-        val needsApproval = when (p.kind) {
-            AgentTools.Kind.READ -> false
-            AgentTools.Kind.EDIT -> !s.autoApproveEdits && p.kind !in sessionApproved
-            AgentTools.Kind.COMMAND -> !s.autoApproveCommands && p.kind !in sessionApproved
+        val key = p.approvalKey
+        val needsApproval = key != null && key !in sessionApproved && when (key) {
+            "edit" -> !s.autoApproveEdits
+            "command" -> !s.autoApproveCommands
+            else -> true
         }
         if (needsApproval) {
-            val f = CompletableFuture<String>()
-            turn.approvals[call.id] = f
             if (p.proposed != null) turn.pendingEdits[call.id] = p
-            if (turn.finished.get()) f.complete("deny")
-            post("toolApproval", chatJson(chat).apply {
-                addProperty("id", call.id)
-                addProperty("kind", p.kind.name.lowercase())
-                addProperty("preview", p.preview.orEmpty())
-                addProperty("hasDiff", p.proposed != null)
-            })
-            if (p.proposed != null && s.showDiffOnApproval) showDiff(p)
-            val decision = try {
-                f.get()
-            } catch (e: Exception) {
-                "deny"
-            } finally {
-                turn.approvals.remove(call.id)
-                turn.pendingEdits.remove(call.id)
-            }
+            if (p.proposed != null && s.showDiffOnApproval) pooled { showDiff(p) }
+            val decision = askApproval(turn, call.id, p.kind.name.lowercase(), p.preview.orEmpty(), p.proposed != null)
+            turn.pendingEdits.remove(call.id)
             if (turn.finished.get()) return "Cancelled: the user stopped the run."
             when (decision) {
-                "always" -> sessionApproved += p.kind
+                "always" -> sessionApproved += key!!
                 "allow" -> Unit
                 else -> {
                     toolEnd(chat, call.id, false, I18n.tr("Denied by you", "رد شد"), null)
@@ -580,6 +662,153 @@ class ChatPanel(private val project: Project) : Disposable {
         toolEnd(chat, call.id, r.ok, r.summary, r.detail)
         val text = r.forModel
         return if (text.length > MAX_TOOL_RESULT) text.take(MAX_TOOL_RESULT) + "\n… (output truncated)" else text
+    }
+
+    /** Shows the approval box and waits for Allow / Always / Deny ("deny" when the run is stopped). */
+    private fun askApproval(turn: Turn, id: String, kind: String, preview: String, hasDiff: Boolean): String {
+        val f = CompletableFuture<String>()
+        turn.approvals[id] = f
+        if (turn.finished.get()) f.complete("deny")
+        post("toolApproval", chatJson(turn.chat).apply {
+            addProperty("id", id)
+            addProperty("kind", kind)
+            addProperty("preview", preview)
+            addProperty("hasDiff", hasDiff)
+        })
+        return try {
+            f.get()
+        } catch (e: Exception) {
+            "deny"
+        } finally {
+            turn.approvals.remove(id)
+        }
+    }
+
+    /** todo_write: validates the list, shows it in the chat and confirms to the model. */
+    private fun todoWrite(chat: String, call: ToolCall): String {
+        val todos = try {
+            JsonParser.parseString(call.arguments.ifBlank { "{}" }).asJsonObject.getAsJsonArray("todos")
+        } catch (e: Exception) {
+            null
+        } ?: return "Error: todos must be an array of {content, status}."
+        val items = JsonArray()
+        for (el in todos) {
+            val o = el as? JsonObject ?: continue
+            val content = o.get("content")?.takeIf { it.isJsonPrimitive }?.asString?.trim().orEmpty()
+            if (content.isEmpty()) continue
+            val status = o.get("status")?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it in setOf("pending", "in_progress", "completed") } ?: "pending"
+            items.add(JsonObject().apply {
+                addProperty("content", content.take(300))
+                addProperty("status", status)
+            })
+        }
+        post("todos", chatJson(chat).apply { add("items", items) })
+        val done = items.count { it.asJsonObject.get("status").asString == "completed" }
+        return "Todo list updated ($done/${items.size()} completed). Keep working on the in_progress task and update the list as you go."
+    }
+
+    /** exit_plan_mode: asks the user to approve the plan; on approval the rest of the run may edit and run commands. */
+    private fun exitPlanMode(turn: Turn, call: ToolCall): String {
+        val chat = turn.chat
+        val plan = try {
+            JsonParser.parseString(call.arguments.ifBlank { "{}" }).asJsonObject.get("plan")?.takeIf { it.isJsonPrimitive }?.asString
+        } catch (e: Exception) {
+            null
+        }?.takeIf { it.isNotBlank() } ?: return "Error: the plan argument is required."
+        if (!turn.plan) return "Plan mode is already off; go ahead and implement."
+        post("toolStart", chatJson(chat).apply {
+            addProperty("id", call.id)
+            addProperty("title", "Plan")
+            addProperty("label", "")
+        })
+        val decision = askApproval(turn, call.id, "plan", plan, false)
+        if (turn.finished.get()) return "Cancelled: the user stopped the run."
+        return when (decision) {
+            "allow", "always" -> {
+                turn.plan = false
+                if (decision == "always") sessionApproved += "edit"
+                post("planMode", chatJson(chat).apply { addProperty("value", false) })
+                toolEnd(chat, call.id, true, I18n.tr("Plan approved", "طرح تأیید شد"), null)
+                "The user approved the plan. Plan mode is off: implement the plan now (you can edit files and run commands). " +
+                    "Track the steps with todo_write."
+            }
+            else -> {
+                toolEnd(chat, call.id, false, I18n.tr("Keep planning", "ادامهٔ برنامه‌ریزی"), null)
+                "The user did not approve the plan and wants to keep planning. Stay in plan mode: ask what should change " +
+                    "and stop until the user answers."
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- MCP
+
+    /** Starts / reloads MCP servers (asks once before running servers defined in the project). */
+    private fun startMcp(chat: String) {
+        val failures = try {
+            mcp.ensureStarted { configs -> askTrustMcp(configs) }
+        } catch (e: Exception) {
+            PluginLog.warn("mcp", "start failed: ${e.javaClass.simpleName}")
+            emptyList()
+        }
+        if (failures.isNotEmpty()) chatNotice(chat, I18n.tr("MCP server failed: ", "سرور MCP اجرا نشد: ") + failures.joinToString("\n"), "warn")
+    }
+
+    private fun askTrustMcp(configs: List<McpServerConfig>): Boolean {
+        var ok = false
+        ApplicationManager.getApplication().invokeAndWait({
+            ok = Messages.showYesNoDialog(
+                project,
+                I18n.tr(
+                    "This project defines MCP servers. They run on your computer with your permissions:\n\n",
+                    "این پروژه سرورهای MCP تعریف کرده است. این سرورها با دسترسی‌های شما روی کامپیوترتان اجرا می‌شوند:\n\n",
+                ) + configs.joinToString("\n") { "• " + it.describe() + "   (" + it.source + ")" } +
+                    I18n.tr("\n\nOnly allow servers you trust. Run them?", "\n\nفقط سرورهایی را که به آن‌ها اعتماد دارید اجازه دهید. اجرا شوند؟"),
+                I18n.tr("ArvanAi: MCP Servers", "ArvanAi: سرورهای MCP"),
+                I18n.tr("Run", "اجرا"),
+                I18n.tr("Don't Run", "اجرا نشود"),
+                Messages.getQuestionIcon(),
+            ) == Messages.YES
+        }, ModalityState.defaultModalityState())
+        return ok
+    }
+
+    /** `/graphify`: builds or updates the project's code graph in a background task (installs graphify if needed). */
+    private fun graphifyBuildCommand(turn: Turn) {
+        val chat = turn.chat
+        GraphifySetup.run(project)
+        finishTurn(turn) {
+            chatNotice(chat, I18n.tr(
+                "Building the code graph in the background (progress in the IDE status bar). When it is done, ask with /graphify <question>.",
+                "ساخت گراف کد در پس‌زمینه شروع شد (پیشرفت در نوار وضعیت IDE). بعد از پایان، با /graphify <سؤال> بپرسید.",
+            ))
+            post("done", chatJson(chat))
+        }
+    }
+
+    /** `/mcp` (status) and `/mcp reload`. */
+    private fun mcpCommand(turn: Turn, reload: Boolean) {
+        val chat = turn.chat
+        post("busy", chatJson(chat).apply { addProperty("busy", true) })
+        if (!ArvanAiSettings.get().mcpEnabled) {
+            finishTurn(turn) {
+                chatNotice(chat, I18n.tr("MCP is turned off in Settings › Tools › ArvanAi.", "MCP در Settings › Tools › ArvanAi خاموش است."))
+                post("done", chatJson(chat))
+            }
+            return
+        }
+        post("status", chatJson(chat).apply { addProperty("text", I18n.tr("Starting MCP servers…", "در حال اجرای سرورهای MCP…")) })
+        if (reload) mcp.reload()
+        startMcp(chat)
+        val lines = mcp.statusLines()
+        finishTurn(turn) {
+            chatNotice(chat, if (lines.isEmpty()) I18n.tr(
+                "No MCP servers configured. Add them to .arvanai/mcp.json in the project (or ~/.arvanai/mcp.json), e.g.\n" +
+                    "{\"mcpServers\": {\"name\": {\"command\": \"npx\", \"args\": [\"-y\", \"package\"]}}}",
+                "هیچ سرور MCP تنظیم نشده است. آن‌ها را در .arvanai/mcp.json پروژه (یا ~/.arvanai/mcp.json) اضافه کنید، مثلاً\n" +
+                    "{\"mcpServers\": {\"name\": {\"command\": \"npx\", \"args\": [\"-y\", \"package\"]}}}",
+            ) else "MCP:\n" + lines.joinToString("\n") { "• $it" })
+            post("done", chatJson(chat))
+        }
     }
 
     /** Opens IntelliJ's diff viewer: the file now vs. the file after the proposed edit. Call off the EDT. */
@@ -646,7 +875,127 @@ class ChatPanel(private val project: Project) : Disposable {
         } finally {
             turns.remove(turn.chat, turn)
             post("busy", chatJson(turn.chat).apply { addProperty("busy", false) })
+            pooled { saveSession(turn.chat) }
         }
+    }
+
+    // ---------------------------------------------------------------- saved sessions (/resume)
+
+    /** Mirrors what the page shows into the chat's transcript, from the events sent to it. */
+    private fun record(chat: String, entry: JsonObject) {
+        val session = sessions[chat] ?: return
+        synchronized(session) {
+            if (session.transcript.size < MAX_TRANSCRIPT) session.transcript += entry
+        }
+    }
+
+    private fun recordEvent(kind: String, payload: JsonObject) {
+        val chat = payload.get("chat")?.takeIf { it.isJsonPrimitive }?.asString ?: return
+        val session = sessions[chat] ?: return
+        fun str(k: String) = payload.get(k)?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        synchronized(session) {
+            val t = session.transcript
+            when (kind) {
+                "delta" -> {
+                    val last = t.lastOrNull()
+                    if (last != null && last.get("t")?.asString == "assistant" && last.get("open")?.asBoolean == true) {
+                        last.addProperty("text", last.get("text").asString + str("text"))
+                    } else if (t.size < MAX_TRANSCRIPT) t += JsonObject().apply {
+                        addProperty("t", "assistant")
+                        addProperty("text", str("text"))
+                        addProperty("open", true)
+                    }
+                }
+                "toolStart" -> {
+                    closeAssistant(t)
+                    if (t.size < MAX_TRANSCRIPT) t += JsonObject().apply {
+                        addProperty("t", "tool")
+                        addProperty("id", str("id"))
+                        addProperty("title", str("title"))
+                        addProperty("label", str("label"))
+                    }
+                }
+                "toolEnd" -> t.lastOrNull { it.get("t")?.asString == "tool" && it.get("id")?.asString == str("id") }?.apply {
+                    addProperty("ended", true)
+                    add("ok", payload.get("ok"))
+                    addProperty("summary", str("summary"))
+                    payload.get("detail")?.let { add("detail", it) }
+                }
+                "todos" -> {
+                    closeAssistant(t)
+                    t += JsonObject().apply {
+                        addProperty("t", "todos")
+                        add("items", payload.get("items"))
+                    }
+                }
+                "notice", "error" -> {
+                    closeAssistant(t)
+                    if (t.size < MAX_TRANSCRIPT) t += JsonObject().apply {
+                        addProperty("t", "notice")
+                        addProperty("text", str("text"))
+                        addProperty("kind", if (kind == "error") "error" else str("kind"))
+                    }
+                }
+                "done" -> closeAssistant(t)
+            }
+        }
+    }
+
+    private fun closeAssistant(t: MutableList<JsonObject>) {
+        t.lastOrNull()?.takeIf { it.get("t")?.asString == "assistant" }?.remove("open")
+    }
+
+    private fun saveSession(chat: String) {
+        val session = sessions[chat] ?: return
+        val conv = conversations[chat] ?: return
+        if (conv.isEmpty()) return
+        val transcript = synchronized(session) { JsonArray().apply { session.transcript.forEach { add(it.deepCopy()) } } }
+        SessionStore.save(project, SessionStore.Session(
+            id = session.id,
+            title = session.title,
+            created = session.created,
+            updated = System.currentTimeMillis(),
+            summary = conv.summary,
+            messages = conv.export(),
+            transcript = transcript,
+        ))
+    }
+
+    private fun sendSessions(chat: String) = post("sessions", chatJson(chat).apply {
+        add("items", JsonArray().apply {
+            SessionStore.list(project).forEach { m ->
+                add(JsonObject().apply {
+                    addProperty("id", m.id)
+                    addProperty("title", m.title)
+                    addProperty("updated", m.updated)
+                    addProperty("messages", m.messages)
+                    addProperty("current", sessions[chat]?.id == m.id)
+                })
+            }
+        })
+    })
+
+    private fun resumeSession(chat: String, id: String) {
+        val saved = SessionStore.load(project, id)
+        if (saved == null) {
+            post("notice", chatJson(chat).apply {
+                addProperty("kind", "error")
+                addProperty("text", I18n.tr("Could not open this conversation.", "باز کردن این گفتگو ممکن نشد."))
+            })
+            return
+        }
+        stopTurn(chat)
+        val conv = conversation(chat)
+        conv.restore(saved.summary, saved.messages)
+        val transcript = saved.transcript.mapNotNull { it as? JsonObject }.toMutableList()
+        sessions[chat] = ChatSession(saved.id, saved.title, saved.created, transcript)
+        PluginLog.info("sessions", "resumed ${saved.messages.size} messages")
+        post("transcript", chatJson(chat).apply {
+            addProperty("title", saved.title)
+            addProperty("updated", saved.updated)
+            add("items", saved.transcript)
+        })
+        postContextSize(chat, conv, conv.snapshot(buildSystemPrompt(ArvanAiSettings.get().agentTools && !toolsUnsupported)))
     }
 
     private fun stopTurn(chat: String) {
@@ -672,16 +1021,18 @@ class ChatPanel(private val project: Project) : Disposable {
     }
 
     /** Agent prompt + language prompt + project rules + the user's own extra prompt. Built fresh for every request. */
-    private fun buildSystemPrompt(useTools: Boolean): String {
+    private fun buildSystemPrompt(useTools: Boolean, plan: Boolean = false, graphify: Boolean = false): String {
         val s = ArvanAiSettings.get()
         return listOf(
             if (useTools) Prompts.agentPrompt(
                 project.basePath ?: "",
                 topLevelListing(),
                 "${SystemInfo.OS_NAME} ${SystemInfo.OS_VERSION}",
-                canEdit = true,
-                canRun = true,
+                canEdit = !plan,
+                canRun = !plan,
             ) else "",
+            if (useTools && plan) Prompts.PLAN_MODE else "",
+            if (useTools && graphify) Prompts.GRAPHIFY_MODE else "",
             if (s.matchReplyLanguage) Prompts.languagePrompt(I18n.lang) else "",
             ProjectInstructions.systemPrompt(project.basePath),
             s.systemPrompt.trim(),
@@ -762,10 +1113,10 @@ class ChatPanel(private val project: Project) : Disposable {
     /** Re-scans on the Kotlin side: the page never supplies paths. */
     private fun importInstructions() {
         val base = project.basePath ?: return
-        val res = InstructionsImporter.move(base, InstructionsImporter.scan(base))
-        PluginLog.info("import", "moved ${res.moved.size}, skipped ${res.skipped.size}")
+        val res = InstructionsImporter.copy(base, InstructionsImporter.scan(base))
+        PluginLog.info("import", "copied ${res.copied.size}, skipped ${res.skipped.size}")
         post("instructionsImported", JsonObject().apply {
-            addProperty("moved", res.moved.size)
+            addProperty("moved", res.copied.size)
             add("skipped", JsonArray().also { arr ->
                 res.skipped.forEach { (item, reason) ->
                     arr.add(JsonObject().apply {
@@ -885,6 +1236,7 @@ class ChatPanel(private val project: Project) : Disposable {
             addProperty("sendOnEnter", s.sendOnEnter)
             addProperty("projectPath", project.basePath ?: "")
             addProperty("model", s.model)
+            add("models", gson.toJsonTree(s.knownModels.toList()))
             addProperty("shareSelection", s.shareSelection)
             addProperty("autoFollow", s.autoFollow)
             addProperty("language", I18n.lang)
@@ -892,6 +1244,7 @@ class ChatPanel(private val project: Project) : Disposable {
     }
 
     private fun post(kind: String, payload: JsonObject) {
+        if (kind in RECORDED) recordEvent(kind, payload)
         val js = "window.bridge && window.bridge.receive(${gson.toJson(kind)}, ${gson.toJson(payload)});"
         synchronized(lock) {
             if (!pageReady) {
@@ -943,6 +1296,8 @@ class ChatPanel(private val project: Project) : Disposable {
         private const val MAX_REF_FILES = 5
         private const val MAX_REF_BYTES = 200_000L
         private const val MAX_TOOL_RESULT = 60_000
+        private const val MAX_TRANSCRIPT = 5_000
+        private val RECORDED = setOf("delta", "toolStart", "toolEnd", "todos", "notice", "error", "done")
         private const val MIN_CONTEXT_LIMIT = 8_000L
         /** Tool outputs kept in full when old ones are pruned. */
         private const val KEEP_TOOL_RESULTS = 6

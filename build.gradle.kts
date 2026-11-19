@@ -18,8 +18,6 @@ dependencies {
     intellijPlatform {
         // IDE used to compile and for `./gradlew runIde`
         intellijIdeaCommunity(providers.gradleProperty("platformVersion").get())
-        // Optional at runtime (arvanai-terminal.xml): used by the "Open Agent" action.
-        bundledPlugin("org.jetbrains.plugins.terminal")
     }
 }
 

@@ -13,6 +13,8 @@ class ArvanAiSettings : PersistentStateComponent<ArvanAiSettings.State> {
         /** OpenAI-compatible base URL of the ArvanCloud AI API (without `/chat/completions`). */
         var baseUrl: String = "https://api.arvancloudai.ir/v1"
         var model: String = "GPT-5.2-Pro"
+        /** Chat models last fetched from `GET {baseUrl}/models`; empty until fetched. */
+        var knownModels: MutableList<String> = mutableListOf()
         var maxCompletionTokens: Int = 8000
         /** Ask the server for a streamed (SSE) reply. */
         var streaming: Boolean = true
@@ -42,17 +44,14 @@ class ArvanAiSettings : PersistentStateComponent<ArvanAiSettings.State> {
         var autoApproveCommands: Boolean = false
         /** Open IntelliJ's diff viewer automatically when an edit waits for approval. */
         var showDiffOnApproval: Boolean = true
+        /** Start MCP servers from .mcp.json / ~/.arvanai/mcp.json and offer their tools to the agent. */
+        var mcpEnabled: Boolean = true
         /** Maximum model requests (tool rounds) per message. */
         var maxAgentSteps: Int = 40
         /** Compact the conversation automatically when it gets close to [contextLimitTokens]. */
         var autoCompact: Boolean = true
         /** Context budget in tokens; compaction starts at 60% of it. Lower = cheaper requests. */
         var contextLimitTokens: Int = 100_000
-
-        /** Model for the terminal agent (Aider); empty = same as [model]. */
-        var agentModel: String = ""
-        /** Offer to set up the agent when a project that is not set up yet is opened. */
-        var agentSetupPrompt: Boolean = true
     }
 
     private var myState = State()

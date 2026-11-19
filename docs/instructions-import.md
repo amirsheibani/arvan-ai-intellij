@@ -1,10 +1,10 @@
 <div dir="rtl" lang="fa">
 
-# قوانین، اسکیل‌ها و دکمهٔ انتقال
+# قوانین، اسکیل‌ها و دکمهٔ کپی
 
-این سند توضیح می‌دهد که ArvanAi قوانین و اسکیل‌های پروژه را از کجا می‌خواند و دکمهٔ «انتقال قوانین و اسکیل‌ها» چه کاری انجام می‌دهد.
+این سند توضیح می‌دهد که ArvanAi قوانین و اسکیل‌های پروژه را از کجا می‌خواند و دکمهٔ «کپی قوانین و اسکیل‌ها» چه کاری انجام می‌دهد.
 
-مرتبط: [ارتباط با API ابرآروان](arvan-api.md) · [README](../README.md)
+مرتبط: [راهنمای شروع](getting-started.md) · [ارتباط با API ابرآروان](arvan-api.md) · [README](../README.md)
 
 ---
 
@@ -19,8 +19,8 @@
    ChatPanel.handleFromJs ──► InstructionsImporter.scan(projectDir)   (pooled thread)
             │ instructionsPreview                     │ Yes/No dialog
             ▼                                         ▼
-   preview in webview ──importInstructions──► scan again ──► InstructionsImporter.move()
-                                                         │  Files.move + rewrite + VFS refresh
+   preview in webview ──importInstructions──► scan again ──► InstructionsImporter.copy()
+                                                         │  Files.copy + rewrite (copy only) + VFS refresh
                                                          ▼
                                      instructionsImported {moved, skipped} → refresh tabs
 ```
@@ -40,6 +40,7 @@
   skills/<name>/SKILL.md    run with /<name> args ($ARGUMENTS)
   commands/**/*.md          run with /<name>
   agents/**/*.md            only listed
+  mcp.json                  MCP servers (see chat-agent.md)
 ```
 
 </div>
@@ -60,20 +61,21 @@
 
 اگر پیام با `/name args` شروع شود و اسکیلی با آن نام وجود داشته باشد، `ProjectInstructions.expandSkill` بدنهٔ اسکیل را بدون front matter برمی‌گرداند. در آن بدنه `$ARGUMENTS` با `args` جایگزین می‌شود و همین متن به‌جای پیام کاربر فرستاده می‌شود.
 
-## ۴. دکمهٔ انتقال
+## ۴. دکمهٔ کپی
 
 | منبع | مقصد |
 |---|---|
 | `.claude/rules/**/*.md` | `.arvanai/rules/…` |
 | `.claude/skills/<name>/` (کل پوشه) | `.arvanai/skills/<name>/` |
 | `.claude/commands/**`، `.claude/agents/**` | `.arvanai/commands/…`، `.arvanai/agents/…` |
-| `AGENTS.md`، `CLAUDE.md`، `.claude/CLAUDE.md` | `.arvanai/AGENTS.md`؛ اگر از قبل وجود داشته باشد، `rules/project-memory*.md` |
+| `AGENTS.md`، `CLAUDE.md`، `.claude/CLAUDE.md` | به ترتیب `.arvanai/rules/project-memory.md`، `project-memory-2.md` و `project-memory-3.md` |
 | `CLAUDE.local.md` | `.arvanai/rules/local-memory.md` |
 | `.cursor/rules/**`، `.cursorrules`، `.windsurfrules`، `.github/copilot-instructions.md` | `.arvanai/rules/…` |
 
-- عملیات **انتقال** (move) است، نه کپی. پوشه‌های منبعی که خالی شوند حذف می‌شوند.
-- در محتوای فایل‌های منتقل‌شده، ارجاع به `.claude/` به `.arvanai/` تغییر می‌کند و ارجاع به `CLAUDE.md` به `AGENTS.md`.
-- `.claude/settings*.json` منتقل **نمی‌شوند**.
+- عملیات **کپی** است. فایل‌های اصلی جابه‌جا، ویرایش یا حذف نمی‌شوند تا ابزارهای دیگر (Claude Code، Cursor، Copilot و …) بدون تداخل کار کنند.
+- موردی که مقصدش از قبل وجود دارد دیگر پیشنهاد نمی‌شود، پس کپی تکراری ساخته نمی‌شود.
+- فقط در محتوای نسخه‌های کپی‌شده، ارجاع به `.claude/` به `.arvanai/` تغییر می‌کند و ارجاع به `CLAUDE.md` به `AGENTS.md`.
+- `.claude/settings*.json` کپی **نمی‌شوند**.
 - اگر مقصد از قبل وجود داشته باشد، آن مورد رد می‌شود و منبعش سر جایش می‌ماند.
 - symlinkها و مسیرهای بیرون از ریشهٔ پروژه نادیده گرفته می‌شوند. مسیرها هم هرگز از webview گرفته نمی‌شوند و Kotlin خودش دوباره اسکن می‌کند.
 
@@ -83,17 +85,17 @@
 
 | فایل | نقش |
 |---|---|
-| `context/InstructionsImporter.kt` | اسکن و انتقال؛ تنها فایلی که نام پوشه‌های ابزارهای دیگر را می‌داند |
+| `context/InstructionsImporter.kt` | اسکن و کپی؛ تنها فایلی که نام پوشه‌های ابزارهای دیگر را می‌داند |
 | `context/ProjectInstructions.kt` | خواندن قوانین و اسکیل‌ها، ساخت system prompt، اجرای اسکیل |
 | `actions/ImportInstructionsAction.kt` | اکشن منوی Tools |
 | `ui/ChatPanel.kt` | پیام‌های `scanInstructions` / `importInstructions` و `skills` / `rules` |
-| `webview/chat.js` | تب‌های Skills و Rules، پیش‌نمایش و دکمهٔ انتقال |
+| `webview/chat.js` | تب‌های Skills و Rules، پیش‌نمایش و دکمهٔ کپی |
 
 ## چک‌لیست اشکال‌یابی
 
 - **تب‌ها خالی است:** آیا `.arvanai/` در ریشهٔ پروژه (`project.basePath`) وجود دارد؟
-- **بعد از انتقال، فایل‌ها در Project View دیده نمی‌شوند:** refresh مربوط به VFS ناهمگام است؛ یک بار **File › Reload All from Disk** بزنید.
-- **یک مورد «target exists» گرفت:** فایل مقصد را بررسی و ادغام کنید و دوباره انتقال را بزنید.
+- **بعد از کپی، فایل‌ها در Project View دیده نمی‌شوند:** refresh مربوط به VFS ناهمگام است؛ یک بار **File › Reload All from Disk** بزنید.
+- **موردی در فهرست نیامد:** مقصدش در `.arvanai/` از قبل وجود دارد. اگر نسخهٔ تازه را می‌خواهید، فایل مقصد را حذف کنید و دوباره کپی را بزنید.
 - **لاگ:** تب Log، با فیلتر `import`.
 
 </div>

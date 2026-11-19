@@ -9,6 +9,9 @@
     sendOnEnter: true,
     projectPath: "",
     model: "",
+    models: [],
+    modelsLoading: false,
+    modelsError: "",
     shareSelectionSetting: true,
     autoFollow: true,
     ctx: null,
@@ -282,6 +285,115 @@
     refreshChatUi();
   }
 
+  // ==================================================================== plan mode
+  function renderMode() {
+    const c = chat();
+    const b = $("modeChip");
+    if (!b) return;
+    const on = !!(c && c.plan);
+    b.classList.toggle("on", on);
+    b.textContent = on ? tr("⏸ plan mode", "⏸ حالت طرح") : tr("⏵ agent", "⏵ ایجنت");
+    b.title = on
+      ? tr("Plan mode: the assistant only reads and plans; it asks before changing anything. Click or Shift+Tab to turn off.",
+        "حالت طرح: دستیار فقط می‌خواند و طرح می‌دهد و قبل از هر تغییر می‌پرسد. برای خاموش کردن کلیک کنید یا Shift+Tab.")
+      : tr("Agent mode: the assistant may edit files and run commands (with your approval). Click or Shift+Tab for plan mode.",
+        "حالت ایجنت: دستیار می‌تواند فایل‌ها را ویرایش و دستور اجرا کند (با تأیید شما). برای حالت طرح کلیک کنید یا Shift+Tab.");
+  }
+  function togglePlan() {
+    const c = chat();
+    if (!c || c.busy) return;
+    c.plan = !c.plan;
+    renderMode();
+  }
+
+  // ==================================================================== todo list
+  function renderTodos(c, items) {
+    flushBlock(c);
+    const d = document.createElement("div");
+    d.className = "tool done";
+    d.innerHTML = '<div class="head"><span class="bullet">⏺</span><div class="call"><span class="name">Update Todos</span></div></div>' +
+      '<div class="result"><span class="elbow">⎿</span><div class="body todos"></div></div>';
+    const body = d.querySelector(".todos");
+    items.forEach((t) => {
+      const r = document.createElement("div");
+      const st = t.status || "pending";
+      r.className = "t " + st;
+      r.dir = textDir(t.content);
+      r.innerHTML = '<span class="box"></span><span class="tx"></span>';
+      r.querySelector(".box").textContent = st === "completed" ? "☒" : st === "in_progress" ? "◐" : "☐";
+      r.querySelector(".tx").textContent = t.content || "";
+      body.appendChild(r);
+    });
+    turnEl(c.main).appendChild(d);
+    scrollDown(c.main);
+  }
+
+  // ==================================================================== saved conversations (/resume)
+  function openResume() {
+    const c = chat();
+    if (!c || c.busy) return;
+    G.resumeAnchor = $("btnMore2");
+    showMenu(G.resumeAnchor, [{ header: tr("Loading…", "در حال بارگذاری…") }]);
+    toIde({ type: "listSessions", chat: c.id });
+  }
+
+  function fmtWhen(ms) {
+    if (!ms) return "";
+    const d = new Date(ms);
+    const mins = Math.round((Date.now() - ms) / 60000);
+    if (mins < 1) return tr("just now", "همین الان");
+    if (mins < 60) return mins + tr(" min ago", " دقیقه پیش");
+    if (mins < 60 * 24) return Math.round(mins / 60) + tr(" h ago", " ساعت پیش");
+    return d.toLocaleDateString(G.lang === "fa" ? "fa-IR" : "en-US") + " " + d.toLocaleTimeString(G.lang === "fa" ? "fa-IR" : "en-US", { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function showSessions(c, p) {
+    if (!G.resumeAnchor || c !== chat()) return;
+    const items = (p.items || []).filter((x) => !x.current);
+    const list = [{ header: tr("Resume a conversation", "ادامهٔ یک گفتگو") }];
+    if (!items.length) list.push({ header: tr("No saved conversations yet.", "هنوز گفتگوی ذخیره‌شده‌ای نیست.") });
+    items.slice(0, 30).forEach((x) => list.push({
+      label: x.title || tr("(untitled)", "(بدون عنوان)"),
+      desc: fmtWhen(x.updated) + " · " + x.messages + tr(" messages", " پیام"),
+      onClick: () => toIde({ type: "resumeSession", chat: c.id, id: x.id }),
+    }));
+    showMenu(G.resumeAnchor, list);
+  }
+
+  /** Rebuilds a chat from a saved transcript. */
+  function renderTranscript(c, p) {
+    c.log.innerHTML = "";
+    Object.assign(c, { title: p.title || "", main: mkTarget(c.log), usage: freshUsage(), failed: false, busy: false, tools: {} });
+    (p.items || []).forEach((it) => {
+      switch (it.t) {
+        case "user":
+          addUser(c.main, it.text || "");
+          break;
+        case "assistant": {
+          const el = newTextBlock(c.main);
+          el.innerHTML = markdown(it.text || "");
+          break;
+        }
+        case "tool":
+          onToolStart(c, it);
+          if (it.ended) onToolEnd(c, it);
+          break;
+        case "todos":
+          renderTodos(c, it.items || []);
+          break;
+        case "notice":
+          notice(c, c.main, it.text || "", it.kind || "");
+          break;
+      }
+    });
+    closeTools(c);
+    c.main.turn = null;
+    notice(c, c.main, tr("⎿  Resumed conversation from ", "⎿  ادامهٔ گفتگوی ") + fmtWhen(p.updated) + ".", "");
+    setBusy(c, false);
+    refreshChatUi();
+    scrollDown(c.main, true);
+  }
+
   function activate(id) {
     G.active = id;
     refreshChatUi();
@@ -294,6 +406,7 @@
     renderTabs();
     renderInfo();
     renderCtx();
+    renderMode();
     syncBusyUi();
   }
 
@@ -533,7 +646,13 @@
     if (!d) return;
     const box = document.createElement("div");
     box.className = "approval";
-    if (p.preview) {
+    const isPlan = p.kind === "plan";
+    if (isPlan) {
+      const md = document.createElement("div");
+      md.className = "plan md";
+      md.innerHTML = markdown(p.preview || "");
+      box.appendChild(md);
+    } else if (p.preview) {
       const pre = document.createElement("pre");
       pre.className = "preview";
       String(p.preview).split("\n").forEach((line) => {
@@ -547,10 +666,13 @@
       box.appendChild(pre);
     }
     const isCmd = p.kind === "command";
+    const isMcp = p.kind === "mcp";
     const q = document.createElement("div");
     q.className = "q";
     q.dir = uiDir();
-    q.textContent = isCmd ? tr("Run this command?", "این دستور اجرا شود؟") : tr("Apply this change?", "این تغییر اعمال شود؟");
+    q.textContent = isPlan ? tr("Would you like to proceed with this plan?", "با این طرح ادامه بدهیم؟")
+      : isMcp ? tr("Allow this MCP tool call?", "این فراخوانی ابزار MCP مجاز است؟")
+      : isCmd ? tr("Run this command?", "این دستور اجرا شود؟") : tr("Apply this change?", "این تغییر اعمال شود؟");
     box.appendChild(q);
     const row = document.createElement("div");
     row.className = "btnrow";
@@ -568,10 +690,12 @@
       row.appendChild(b);
       return b;
     };
-    const first = btn(tr("Allow", "اجازه"), "primary", "allow");
-    btn(isCmd ? tr("Always allow commands (this session)", "همیشه اجازهٔ اجرای دستور (این نشست)")
+    const first = btn(isPlan ? tr("Yes, start", "بله، شروع کن") : tr("Allow", "اجازه"), "primary", "allow");
+    btn(isPlan ? tr("Yes, and auto-accept edits", "بله، و ویرایش‌ها را خودکار بپذیر")
+      : isMcp ? tr("Always allow this server (this session)", "همیشه اجازه برای این سرور (این نشست)")
+      : isCmd ? tr("Always allow commands (this session)", "همیشه اجازهٔ اجرای دستور (این نشست)")
       : tr("Always allow edits (this session)", "همیشه اجازهٔ ویرایش (این نشست)"), "pillbtn", "always");
-    btn(tr("Deny", "رد"), "pillbtn", "deny");
+    btn(isPlan ? tr("No, keep planning", "نه، ادامهٔ برنامه‌ریزی") : tr("Deny", "رد"), "pillbtn", "deny");
     if (p.hasDiff) {
       const v = document.createElement("button");
       v.className = "pillbtn";
@@ -650,6 +774,13 @@
     items.forEach((it) => {
       if (it.sep) return m.insertAdjacentHTML("beforeend", '<div class="msep"></div>');
       if (it.header) return m.insertAdjacentHTML("beforeend", '<div class="mh">' + esc(it.header) + "</div>");
+      if (it.error) {
+        const d = document.createElement("div");
+        d.className = "merr";
+        d.dir = textDir(it.error);
+        d.textContent = it.error;
+        return m.appendChild(d);
+      }
       if (it.input) {
         const inp = document.createElement("input");
         inp.placeholder = it.input.placeholder || "";
@@ -715,30 +846,67 @@
   }
 
   function modelMenu(anchor) {
-    const items = [];
-    const known = [["GPT-5.2-Pro", tr("Default ArvanCloud model", "مدل پیش‌فرض آروان‌کلود")]];
-    known.forEach((m) => items.push({ label: m[0], desc: m[1], checked: G.model === m[0], onClick: () => setModel(m[0], true) }));
-    if (G.model && !known.some((m) => m[0] === G.model)) items.push({ label: G.model, checked: true });
-    items.push({ sep: true }, { header: tr("Other model", "مدل دیگر") }, {
-      input: {
-        placeholder: tr("Model name, then Enter", "نام مدل و Enter"),
-        onEnter: (v) => {
-          if (!v.trim()) return;
-          setModel(v.trim(), true);
-          closeMenu();
+    const list = G.models.length ? G.models.slice() : ["GPT-5.2-Pro"];
+    if (G.model && list.indexOf(G.model) < 0) list.unshift(G.model);
+    let shown = list;
+    const render = (q) => {
+      const box = $("modelList");
+      if (!box) return;
+      q = (q || "").trim().toLowerCase();
+      shown = q ? list.filter((m) => m.toLowerCase().indexOf(q) >= 0) : list;
+      box.innerHTML = "";
+      shown.forEach((m) => box.appendChild(menuItem({ label: m, checked: G.model === m, onClick: () => setModel(m, true) })));
+      if (!shown.length) box.insertAdjacentHTML("beforeend", '<div class="mh">' + esc(tr("No match — Enter uses the typed name", "موردی نیست — Enter همین نام را استفاده می‌کند")) + "</div>");
+    };
+    const items = [
+      {
+        input: {
+          placeholder: tr("Search or type a model name, then Enter", "جستجو یا نام مدل و Enter"),
+          focus: true,
+          onInput: render,
+          onEnter: (v) => {
+            const name = shown.length === 1 ? shown[0] : v.trim();
+            if (!name) return;
+            setModel(name, true);
+            closeMenu();
+          },
         },
+      },
+      { slot: "modelList" },
+      { sep: true },
+    ];
+    if (G.modelsError) items.push({ error: G.modelsError });
+    items.push({
+      label: G.modelsLoading ? tr("Loading models…", "در حال دریافت مدل‌ها…") : tr("Refresh model list from ArvanCloud", "به‌روزرسانی فهرست مدل‌ها از ابرآروان"),
+      desc: G.models.length ? tr(G.models.length + " chat models", G.models.length + " مدل چت") : "",
+      onClick: () => {
+        fetchModels();
+        modelMenu(anchor); // keep the menu open; it is re-rendered when the list arrives
       },
     });
     showMenu(anchor, items);
+    render("");
+    // First open with no list yet: load it once in the background.
+    if (!G.models.length && !G.modelsLoading && !G.modelsError && G.hasKey !== false) {
+      fetchModels();
+      modelMenu(anchor);
+    }
+  }
+  function fetchModels() {
+    if (G.modelsLoading) return;
+    G.modelsLoading = true;
+    G.modelsError = "";
+    toIde({ type: "fetchModels" });
   }
   function moreMenu(anchor) {
     showMenu(anchor, [
       { label: tr("Auto-scroll", "دنبال کردن خودکار اسکرول"), checked: G.autoFollow, onClick: () => { G.autoFollow = !G.autoFollow; toIde({ type: "setAutoFollow", value: G.autoFollow }); } },
       { label: tr("Search in chat", "جستجو در گفتگو"), onClick: openSearch },
       { label: tr("Clear this chat (/clear)", "پاک کردن این گفتگو (/clear)"), onClick: () => chat() && clearChat(chat()) },
+      { label: tr("Resume a conversation (/resume)", "ادامهٔ یک گفتگو (/resume)"), onClick: () => setTimeout(openResume, 0) },
       { label: tr("Language: فارسی", "زبان: English"), onClick: () => setLang(G.lang === "fa" ? "en" : "fa", true) },
       { sep: true },
-      { label: tr("Import rules & skills", "انتقال قوانین و اسکیل‌ها"), onClick: () => { switchView("rules"); requestImportScan(); } },
+      { label: tr("Import rules & skills", "کپی قوانین و اسکیل‌ها"), onClick: () => { switchView("rules"); requestImportScan(); } },
       { label: tr("Plugin log", "لاگ پلاگین"), onClick: () => switchView("log") },
       { label: tr("Settings", "تنظیمات"), onClick: () => toIde({ type: "settings" }) },
       { sep: true },
@@ -900,20 +1068,20 @@
   };
   function importHtml() {
     const p = G.importPreview;
-    let html = '<div class="cardbox"><h4>' + tr("Import rules & skills", "انتقال قوانین و اسکیل‌ها") + '</h4><div class="muted">' +
-      tr('Moves existing rules and skills from other AI tools\' folders into <span class="mono ltr">.arvanai</span>. You see the list first.',
-        'قوانین و اسکیل‌های موجود در پوشه‌های ابزارهای هوش مصنوعی دیگر را به <span class="mono ltr">.arvanai</span> منتقل می‌کند. ابتدا فهرست را می‌بینید.') + "</div>";
+    let html = '<div class="cardbox"><h4>' + tr("Import rules & skills", "کپی قوانین و اسکیل‌ها") + '</h4><div class="muted">' +
+      tr('Copies existing rules and skills from other AI tools\' folders into <span class="mono ltr">.arvanai</span>. The originals are not changed, so those tools keep working. You see the list first.',
+        'قوانین و اسکیل‌های موجود در پوشه‌های ابزارهای هوش مصنوعی دیگر را در <span class="mono ltr">.arvanai</span> کپی می‌کند. فایل‌های اصلی دست نمی‌خورند و آن ابزارها به کارشان ادامه می‌دهند. ابتدا فهرست را می‌بینید.') + "</div>";
     if (p && p.items.length) {
       html += '<div class="rows">' + p.items.map((x) => {
         const k = KIND_LABEL[x.kind];
         return '<div class="r"><span class="tag">' + esc(k ? tr(k[0], k[1]) : x.kind) + '</span><span class="grow"><span class="code">' + esc(x.name) +
           '</span><span class="sub mono ltr">' + esc(x.source) + " → " + esc(x.target) + "</span></span></div>";
       }).join("") + "</div>" +
-        '<div class="btnrow"><button class="primary" data-import-confirm="1">' + tr("Move " + p.items.length + " item(s)", "انتقال " + p.items.length + " مورد") + "</button>" +
+        '<div class="btnrow"><button class="primary" data-import-confirm="1">' + tr("Copy " + p.items.length + " item(s)", "کپی " + p.items.length + " مورد") + "</button>" +
         '<button class="pillbtn" data-import-cancel="1">' + tr("Cancel", "لغو") + "</button></div>";
     } else {
-      if (p) html += '<div class="empty-note">' + tr("Nothing to import was found.", "چیزی برای انتقال پیدا نشد.") + "</div>";
-      html += '<div class="btnrow"><button class="primary" data-import-scan="1">' + tr("Import rules & skills", "انتقال قوانین و اسکیل‌ها") + "</button></div>";
+      if (p) html += '<div class="empty-note">' + tr("Nothing new to import was found.", "چیز تازه‌ای برای کپی پیدا نشد.") + "</div>";
+      html += '<div class="btnrow"><button class="primary" data-import-scan="1">' + tr("Import rules & skills", "کپی قوانین و اسکیل‌ها") + "</button></div>";
     }
     if (G.importNote) html += '<div class="notice" dir="' + textDir(G.importNote) + '">' + esc(G.importNote) + "</div>";
     return html + "</div>";
@@ -979,7 +1147,7 @@
         " · " + m.lines + tr(" lines", " خط") + '</span><div class="preview" dir="' + textDir(m.preview, "ltr") + '">' + esc(m.preview || "") + "</div></span>" +
         '<span class="acts"><button class="icon" data-open-path="' + esc(m.path) + '" title="' + tr("Open", "باز کردن") + '">↗</button></span></div>').join("")
         : '<div class="empty-note">' + tr("No rules yet. Add Markdown files under .arvanai/rules or import existing ones below.",
-          "هنوز قانونی نیست. فایل‌های Markdown را در .arvanai/rules بگذارید یا موارد موجود را در پایین منتقل کنید.") + "</div>") + "</div></div>" + importHtml();
+          "هنوز قانونی نیست. فایل‌های Markdown را در .arvanai/rules بگذارید یا موارد موجود را در پایین کپی کنید.") + "</div>") + "</div></div>" + importHtml();
   }
   // ---------------------------------------------------------------- git
   // ---------------------------------------------------------------- git
@@ -1089,6 +1257,7 @@
           document.querySelectorAll(".welcome .cwd").forEach((e) => (e.textContent = "cwd: " + G.projectPath));
           if (p.language && p.language !== G.lang) setLang(p.language, false);
           setModel(p.model, false);
+          if (Array.isArray(p.models)) G.models = p.models;
           if (p.shareSelection !== undefined) G.shareSelectionSetting = p.shareSelection;
           if (p.autoFollow !== undefined) G.autoFollow = p.autoFollow;
           document.body.classList.toggle("light", !p.dark);
@@ -1096,6 +1265,13 @@
           renderCtx();
           break;
         }
+        case "models":
+          G.modelsLoading = false;
+          G.modelsError = p.error || "";
+          if (Array.isArray(p.items)) G.models = p.items;
+          // Re-open the model menu so the new list (or the error) shows right away.
+          if (menuAnchor === $("ddModel")) modelMenu($("ddModel"));
+          break;
         case "context":
           G.ctx = p && p.file ? p : null;
           renderCtx();
@@ -1126,6 +1302,21 @@
           break;
         case "toolEnd":
           if (c) onToolEnd(c, p);
+          break;
+        case "todos":
+          if (c) renderTodos(c, p.items || []);
+          break;
+        case "planMode":
+          if (c) {
+            c.plan = !!p.value;
+            if (c === chat()) renderMode();
+          }
+          break;
+        case "sessions":
+          if (c) showSessions(c, p);
+          break;
+        case "transcript":
+          if (c) renderTranscript(c, p);
           break;
         case "contextSize":
           if (c) {
@@ -1188,7 +1379,7 @@
         case "instructionsImported": {
           const skipped = p.skipped || [];
           G.importPreview = null;
-          G.importNote = tr("Moved " + (p.moved || 0) + " item(s) into .arvanai.", (p.moved || 0) + " مورد به .arvanai منتقل شد.") +
+          G.importNote = tr("Copied " + (p.moved || 0) + " item(s) into .arvanai.", (p.moved || 0) + " مورد در .arvanai کپی شد.") +
             (skipped.length ? tr(" Skipped: ", " رد شد: ") + skipped.map((x) => x.name + " (" + x.reason + ")").join("، ") : "");
           refreshImportUi();
           break;
@@ -1203,6 +1394,11 @@
     const c = chat();
     if (!text || !c || c.busy) return;
     if (text === "/clear" || text === "/new") return clearChat(c);
+    if (text === "/resume") {
+      inputEl.value = "";
+      closeSlash();
+      return openResume();
+    }
     addUser(c.main, text);
     if (!c.title) c.title = text.replace(/\s+/g, " ").slice(0, 60);
     c.failed = false;
@@ -1212,7 +1408,7 @@
     refreshChatUi();
     closeMention();
     closeSlash();
-    toIde({ type: "send", chat: c.id, text, shareContext: c.shareCtx, expandRefs: expandRefs !== false });
+    toIde({ type: "send", chat: c.id, text, shareContext: c.shareCtx, expandRefs: expandRefs !== false, plan: !!c.plan });
   }
 
   function autoGrow() {
@@ -1229,6 +1425,10 @@
   inputEl.addEventListener("click", updateMention);
   inputEl.addEventListener("blur", () => setTimeout(() => { closeMention(); closeSlash(); }, 150));
   inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Tab" && e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      return togglePlan();
+    }
     const sl = G.slash;
     if (sl.open && !e.isComposing) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -1393,6 +1593,7 @@
   $("searchNext").addEventListener("click", () => findNext(false));
   $("searchPrev").addEventListener("click", () => findNext(true));
   $("searchClose").addEventListener("click", () => $("searchBar").classList.add("hidden"));
+  $("modeChip").addEventListener("click", togglePlan);
   $("ctxChip").addEventListener("click", () => {
     const c = chat();
     if (c) c.shareCtx = !c.shareCtx;
@@ -1437,7 +1638,7 @@
       return refreshImportUi();
     }
     if (t.closest("[data-import-confirm]")) {
-      G.importNote = tr("Moving…", "در حال انتقال…");
+      G.importNote = tr("Copying…", "در حال کپی…");
       G.importPreview = null;
       refreshImportUi();
       return toIde({ type: "importInstructions" });
