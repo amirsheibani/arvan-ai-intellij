@@ -9,6 +9,7 @@ import com.intellij.openapi.application.ApplicationManager
 import ir.arvanai.I18n
 import ir.arvanai.PluginLog
 import ir.arvanai.chat.ChatMessage
+import ir.arvanai.chat.ToolCall
 import ir.arvanai.settings.ApiKeyStore
 import ir.arvanai.settings.ArvanAiSettings
 import java.io.InputStream
@@ -31,10 +32,15 @@ import java.util.concurrent.ExecutionException
  */
 object ArvanClient {
 
+    /** A finished reply: text and/or the tool calls the model wants to make. */
+    class Reply(val text: String, val toolCalls: List<ToolCall>, val usage: JsonObject?)
+
     interface Listener {
         fun onDelta(text: String)
-        fun onDone(fullText: String, usage: JsonObject?)
-        fun onError(message: String)
+        fun onDone(reply: Reply)
+
+        /** [status] is the HTTP status (0 for network or protocol errors). */
+        fun onError(message: String, status: Int = 0)
     }
 
     /** A request in flight. [cancel] aborts it; no listener callback is made afterwards. */
@@ -66,7 +72,7 @@ object ArvanClient {
 
     /** One shared client; rebuilt only when the proxy setting changes. */
     @Synchronized
-    private fun client(): HttpClient {
+    internal fun client(): HttpClient {
         val proxy = ArvanAiSettings.get().httpsProxy.trim()
         cachedClient?.let { if (proxy == cachedProxy) return it }
         val b = HttpClient.newBuilder()
@@ -92,11 +98,12 @@ object ArvanClient {
         }
     }
 
-    fun send(messages: List<ChatMessage>, listener: Listener): Handle {
+    /** [tools] are OpenAI-style function definitions; null sends a plain chat request. */
+    fun send(messages: List<ChatMessage>, tools: JsonArray?, listener: Listener): Handle {
         val handle = Handle()
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                run(messages, listener, handle)
+                run(messages, tools, listener, handle)
             } catch (e: Throwable) {
                 if (!handle.cancelled) {
                     PluginLog.warn("api", "Request failed: ${e.javaClass.simpleName}")
@@ -107,7 +114,85 @@ object ArvanClient {
         return handle
     }
 
-    private fun run(messages: List<ChatMessage>, listener: Listener, handle: Handle) {
+    /** Thrown by [listModels]; [message] is ready to show to the user. */
+    class ApiException(message: String) : Exception(message)
+
+    /** Ids that are not chat models (embeddings, speech, image generation). */
+    private val NON_CHAT = Regex("(?i)embed|bge|whisper|transcribe|tts|image|dall-?e")
+
+    /**
+     * `GET {baseUrl}/models`: the chat models available to this API key, sorted by name.
+     * Blocking; call it off the EDT. Throws [ApiException] with a user-facing message.
+     * [apiKey] / [baseUrl] override the saved values (the settings page passes what is typed but not applied yet).
+     */
+    fun listModels(apiKey: String? = null, baseUrl: String? = null): List<String> {
+        val key = apiKey?.takeIf { it.isNotBlank() } ?: ApiKeyStore.get() ?: throw ApiException(
+            I18n.tr("No API key is set. Add it in Settings › Tools › ArvanAi.", "کلید API تنظیم نشده است. آن را در Settings › Tools › ArvanAi وارد کنید.")
+        )
+        val base = baseUrl?.takeIf { it.isNotBlank() } ?: ArvanAiSettings.get().baseUrl
+        val uri = try {
+            URI(base.trim().trimEnd('/') + "/models").also { require(it.scheme == "https" || it.scheme == "http") }
+        } catch (e: Exception) {
+            throw ApiException(I18n.tr("The base URL in Settings is not valid.", "نشانی پایه در تنظیمات معتبر نیست."))
+        }
+        val request = HttpRequest.newBuilder(uri)
+            .timeout(Duration.ofSeconds(30))
+            .header("Authorization", "apikey $key")
+            .header("Accept", "application/json")
+            .GET()
+            .build()
+        val response = try {
+            client().send(request, HttpResponse.BodyHandlers.ofString(UTF_8))
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw ApiException(describe(CancellationException()))
+        } catch (e: Exception) {
+            throw ApiException(describe(e))
+        }
+        val text = response.body().orEmpty()
+        val status = response.statusCode()
+        if (status !in 200..299) {
+            val type = response.headers().firstValue("Content-Type").orElse("?")
+            PluginLog.warn("api", "GET /models HTTP $status body=${plainText(text).take(300)}")
+            val detail = extractError(text).ifBlank { plainText(text).take(200) }
+            throw ApiException(httpError(status, detail, status == 403 && type.contains("html", ignoreCase = true)))
+        }
+        val data = try {
+            JsonParser.parseString(text).asJsonObject.getAsJsonArray("data")
+        } catch (e: Exception) {
+            null
+        } ?: throw ApiException(I18n.tr("The server returned an unreadable reply.", "پاسخ سرور قابل خواندن نبود."))
+        val ids = data.mapNotNull { (it as? JsonObject)?.get("id")?.takeIf { id -> id.isJsonPrimitive }?.asString?.trim() }
+            .filter { it.isNotEmpty() && !NON_CHAT.containsMatchIn(it) }
+            .distinct()
+            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+        PluginLog.info("api", "GET /models: ${data.size()} models, ${ids.size} chat models")
+        return ids
+    }
+
+    private fun messageJson(m: ChatMessage) = JsonObject().apply {
+        addProperty("role", m.role)
+        if (m.role == "assistant" && m.toolCalls.isNotEmpty()) {
+            if (m.content.isEmpty()) add("content", com.google.gson.JsonNull.INSTANCE) else addProperty("content", m.content)
+            add("tool_calls", JsonArray().also { arr ->
+                m.toolCalls.forEach { c ->
+                    arr.add(JsonObject().apply {
+                        addProperty("id", c.id)
+                        addProperty("type", "function")
+                        add("function", JsonObject().apply {
+                            addProperty("name", c.name)
+                            addProperty("arguments", c.arguments.ifBlank { "{}" })
+                        })
+                    })
+                }
+            })
+        } else {
+            addProperty("content", m.content)
+        }
+        m.toolCallId?.let { addProperty("tool_call_id", it) }
+    }
+
+    private fun run(messages: List<ChatMessage>, tools: JsonArray?, listener: Listener, handle: Handle) {
         val s = ArvanAiSettings.get()
         val key = ApiKeyStore.get()
         if (key == null) {
@@ -129,14 +214,11 @@ object ArvanClient {
         val stream = s.streaming
         val body = JsonObject().apply {
             addProperty("model", s.model.trim())
-            add("messages", JsonArray().also { arr ->
-                messages.forEach { m ->
-                    arr.add(JsonObject().apply {
-                        addProperty("role", m.role)
-                        addProperty("content", m.content)
-                    })
-                }
-            })
+            add("messages", JsonArray().also { arr -> messages.forEach { arr.add(messageJson(it)) } })
+            if (tools != null && tools.size() > 0) {
+                add("tools", tools)
+                addProperty("tool_choice", "auto")
+            }
             addProperty("max_completion_tokens", s.maxCompletionTokens)
             if (stream) addProperty("stream", true)
         }
@@ -147,7 +229,7 @@ object ArvanClient {
             .header("Accept", if (stream) "text/event-stream, application/json" else "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(body), UTF_8))
             .build()
-        PluginLog.info("api", "POST /chat/completions model=${s.model.trim()} messages=${messages.size} stream=$stream")
+        PluginLog.info("api", "POST /chat/completions model=${s.model.trim()} messages=${messages.size} tools=${tools?.size() ?: 0} stream=$stream")
 
         val future = client().sendAsync(request, HttpResponse.BodyHandlers.ofInputStream())
         handle.future = future
@@ -166,8 +248,13 @@ object ArvanClient {
             val status = response.statusCode()
             if (status !in 200..299) {
                 val text = String(input.readNBytes(MAX_ERROR_BODY), UTF_8)
-                PluginLog.warn("api", "HTTP $status")
-                listener.onError(httpError(status, extractError(text)))
+                val type = response.headers().firstValue("Content-Type").orElse("?")
+                val server = response.headers().firstValue("Server").orElse("?")
+                PluginLog.warn("api", "HTTP $status type=$type server=$server body=${plainText(text).take(500)}")
+                val detail = extractError(text).ifBlank { plainText(text).take(200) }
+                // Only an HTML page means something in front of the API (firewall / proxy) answered.
+                val blocked = status == 403 && type.contains("html", ignoreCase = true)
+                listener.onError(httpError(status, detail, blocked), status)
                 return
             }
             val contentType = response.headers().firstValue("Content-Type").orElse("").lowercase()
@@ -186,6 +273,7 @@ object ArvanClient {
     private fun readSse(lines: Sequence<String>, listener: Listener, handle: Handle) {
         val full = StringBuilder()
         var usage: JsonObject? = null
+        val calls = ToolCallAccumulator()
         try {
             for (line in lines) {
                 if (handle.cancelled) return
@@ -204,7 +292,9 @@ object ArvanClient {
                 }
                 (obj.get("usage") as? JsonObject)?.let { usage = it }
                 val choice = obj.getAsJsonArray("choices")?.firstOrNull()?.asJsonObject ?: continue
-                val delta = choice.getAsJsonObject("delta")?.get("content")?.takeIf { it.isJsonPrimitive }?.asString
+                val deltaObj = choice.getAsJsonObject("delta")
+                (deltaObj?.get("tool_calls") as? JsonArray)?.let { calls.add(it) }
+                val delta = deltaObj?.get("content")?.takeIf { it.isJsonPrimitive }?.asString
                 if (!delta.isNullOrEmpty()) {
                     full.append(delta)
                     listener.onDelta(delta)
@@ -212,12 +302,12 @@ object ArvanClient {
             }
         } catch (e: java.io.IOException) {
             if (handle.cancelled) return
-            if (full.isEmpty()) throw e
+            if (full.isEmpty() || !calls.isEmpty()) throw e
             // Connection dropped mid-answer: keep what we have.
             PluginLog.warn("api", "Stream interrupted after ${full.length} chars")
         }
         if (handle.cancelled) return
-        finish(full.toString(), usage, listener)
+        finish(full.toString(), calls.result(), usage, listener)
     }
 
     private fun readJson(text: String, listener: Listener) {
@@ -231,17 +321,44 @@ object ArvanClient {
             listener.onError(errorText(it))
             return
         }
-        val content = obj.getAsJsonArray("choices")?.firstOrNull()?.asJsonObject
-            ?.getAsJsonObject("message")?.get("content")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        val message = obj.getAsJsonArray("choices")?.firstOrNull()?.asJsonObject?.getAsJsonObject("message")
+        val content = message?.get("content")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        val calls = ToolCallAccumulator()
+        (message?.get("tool_calls") as? JsonArray)?.let { calls.add(it) }
         if (content.isNotEmpty()) listener.onDelta(content)
-        finish(content, obj.get("usage") as? JsonObject, listener)
+        finish(content, calls.result(), obj.get("usage") as? JsonObject, listener)
     }
 
-    private fun finish(text: String, usage: JsonObject?, listener: Listener) {
-        if (text.isEmpty()) {
+    private fun finish(text: String, toolCalls: List<ToolCall>, usage: JsonObject?, listener: Listener) {
+        if (text.isEmpty() && toolCalls.isEmpty()) {
             listener.onError(I18n.tr("The model returned an empty reply.", "مدل پاسخ خالی برگرداند."))
         } else {
-            listener.onDone(text, usage)
+            listener.onDone(Reply(text, toolCalls, usage))
+        }
+    }
+
+    /** Joins tool-call fragments: streams send `id`/`name` once and `arguments` in pieces, keyed by `index`. */
+    private class ToolCallAccumulator {
+        private class Part(var id: String = "", var name: String = "", val args: StringBuilder = StringBuilder())
+
+        private val parts = sortedMapOf<Int, Part>()
+
+        fun isEmpty() = parts.isEmpty()
+
+        fun add(arr: JsonArray) {
+            arr.forEachIndexed { pos, el ->
+                val o = el as? JsonObject ?: return@forEachIndexed
+                val idx = o.get("index")?.takeIf { it.isJsonPrimitive }?.asInt ?: pos
+                val p = parts.getOrPut(idx) { Part() }
+                o.get("id")?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotEmpty() }?.let { p.id = it }
+                val fn = o.getAsJsonObject("function") ?: return@forEachIndexed
+                fn.get("name")?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotEmpty() }?.let { p.name = it }
+                fn.get("arguments")?.takeIf { it.isJsonPrimitive }?.asString?.let { p.args.append(it) }
+            }
+        }
+
+        fun result(): List<ToolCall> = parts.entries.filter { it.value.name.isNotEmpty() }.map { (i, p) ->
+            ToolCall(p.id.ifEmpty { "call_${System.nanoTime()}_$i" }, p.name, p.args.toString())
         }
     }
 
@@ -263,14 +380,35 @@ object ArvanClient {
         return ""
     }
 
-    private fun httpError(status: Int, serverMessage: String): String {
-        val base = when (status) {
-            401, 403 -> I18n.tr("The API key is invalid or missing (HTTP $status).", "کلید API نامعتبر است یا وجود ندارد (HTTP $status).")
-            404 -> I18n.tr("Endpoint or model not found (HTTP 404). Check the base URL and model name.", "نشانی یا مدل پیدا نشد (HTTP 404). نشانی پایه و نام مدل را بررسی کنید.")
-            400, 422 -> I18n.tr("The request was rejected (HTTP $status).", "درخواست پذیرفته نشد (HTTP $status).")
-            429 -> I18n.tr("Too many requests or quota exceeded (HTTP 429). Try again later.", "تعداد درخواست‌ها زیاد است یا سهمیه تمام شده (HTTP 429). بعداً دوباره تلاش کنید.")
-            in 500..599 -> I18n.tr("The server had an error (HTTP $status). Try again later.", "سرور خطا داد (HTTP $status). بعداً دوباره تلاش کنید.")
-            else -> I18n.tr("Unexpected reply from the server (HTTP $status).", "پاسخ غیرمنتظره از سرور (HTTP $status).")
+    /** Body text without HTML tags and extra whitespace (error pages from a firewall or proxy are HTML). */
+    private fun plainText(body: String): String =
+        body.replace(Regex("(?is)<(script|style)[^>]*>.*?</\\1>"), " ")
+            .replace(Regex("<[^>]+>"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    private fun httpError(status: Int, serverMessage: String, blocked: Boolean = false): String {
+        val base = when {
+            serverMessage.contains("debtor", ignoreCase = true) -> I18n.tr(
+                "Your ArvanCloud account has a negative balance (HTTP $status). Top up your account in the ArvanCloud panel and try again.",
+                "حساب ابرآروان شما بدهکار است (HTTP $status). حساب را در پنل ابرآروان شارژ کنید و دوباره تلاش کنید.",
+            )
+            blocked -> I18n.tr(
+                "The request was blocked before reaching the API (HTTP 403, HTML page). A firewall or proxy may have rejected it.",
+                "درخواست پیش از رسیدن به API مسدود شد (HTTP 403، صفحهٔ HTML). احتمالاً فایروال یا پراکسی آن را رد کرده است.",
+            )
+            status == 401 -> I18n.tr("The API key is invalid or missing (HTTP 401).", "کلید API نامعتبر است یا وجود ندارد (HTTP 401).")
+            status == 403 -> I18n.tr(
+                "Access denied (HTTP 403): the key may be invalid, have no access to this model, or be out of credit.",
+                "دسترسی رد شد (HTTP 403): ممکن است کلید نامعتبر باشد، به این مدل دسترسی نداشته باشد یا اعتبار حساب تمام شده باشد.",
+            )
+            else -> when (status) {
+                404 -> I18n.tr("Endpoint or model not found (HTTP 404). Check the base URL and model name.", "نشانی یا مدل پیدا نشد (HTTP 404). نشانی پایه و نام مدل را بررسی کنید.")
+                400, 422 -> I18n.tr("The request was rejected (HTTP $status).", "درخواست پذیرفته نشد (HTTP $status).")
+                429 -> I18n.tr("Too many requests or quota exceeded (HTTP 429). Try again later.", "تعداد درخواست‌ها زیاد است یا سهمیه تمام شده (HTTP 429). بعداً دوباره تلاش کنید.")
+                in 500..599 -> I18n.tr("The server had an error (HTTP $status). Try again later.", "سرور خطا داد (HTTP $status). بعداً دوباره تلاش کنید.")
+                else -> I18n.tr("Unexpected reply from the server (HTTP $status).", "پاسخ غیرمنتظره از سرور (HTTP $status).")
+            }
         }
         val detail = serverMessage.trim().take(400)
         return if (detail.isEmpty()) base else "$base\n$detail"

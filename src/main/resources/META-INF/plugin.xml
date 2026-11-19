@@ -66,12 +66,12 @@
                 icon="/icons/arvanai.svg"
                 description="Open the ArvanAi chat">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
-            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift L"/>
+            <!-- No default shortcut: Ctrl/Cmd+Alt+Shift+L is the IDE's own "Reformat File…". Users can assign one in Keymap. -->
         </action>
         <action id="ArvanAi.ImportInstructions"
                 class="ir.arvanai.actions.ImportInstructionsAction"
                 text="ArvanAi: Import Rules &amp; Skills"
-                description="Move rules and skills from other AI tools' folders into .arvanai/">
+                description="Copy rules and skills from other AI tools' folders into .arvanai/ (originals stay)">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
         </action>
     </actions>

@@ -13,6 +13,8 @@ class ArvanAiSettings : PersistentStateComponent<ArvanAiSettings.State> {
         /** OpenAI-compatible base URL of the ArvanCloud AI API (without `/chat/completions`). */
         var baseUrl: String = "https://api.arvancloudai.ir/v1"
         var model: String = "GPT-5.2-Pro"
+        /** Chat models last fetched from `GET {baseUrl}/models`; empty until fetched. */
+        var knownModels: MutableList<String> = mutableListOf()
         var maxCompletionTokens: Int = 8000
         /** Ask the server for a streamed (SSE) reply. */
         var streaming: Boolean = true
@@ -22,6 +24,10 @@ class ArvanAiSettings : PersistentStateComponent<ArvanAiSettings.State> {
         var shareSelection: Boolean = true
         /** Keep the chat scrolled to the bottom while the assistant writes. */
         var autoFollow: Boolean = true
+        /** The agent uses the project's graphify code graph on every message (the graphify button in the chat toolbar). */
+        var useGraphify: Boolean = false
+        /** Keep the graph in the project's `graphify-out/` (shared with a graphify CLI) instead of the IDE system folder. */
+        var graphInProject: Boolean = false
 
         /** UI language: "en" (default) or "fa". */
         var language: String = "en"
@@ -33,6 +39,23 @@ class ArvanAiSettings : PersistentStateComponent<ArvanAiSettings.State> {
         var httpsProxy: String = ""
         var fontSize: Int = 14
         var sendOnEnter: Boolean = true
+
+        /** Chat works as an agent: the model may call tools (read/search files, edit, run commands). */
+        var agentTools: Boolean = true
+        /** Apply file edits without asking. */
+        var autoApproveEdits: Boolean = false
+        /** Run shell commands without asking. */
+        var autoApproveCommands: Boolean = false
+        /** Open IntelliJ's diff viewer automatically when an edit waits for approval. */
+        var showDiffOnApproval: Boolean = true
+        /** Start MCP servers from .mcp.json / ~/.arvanai/mcp.json and offer their tools to the agent. */
+        var mcpEnabled: Boolean = true
+        /** Maximum model requests (tool rounds) per message. */
+        var maxAgentSteps: Int = 40
+        /** Compact the conversation automatically when it gets close to [contextLimitTokens]. */
+        var autoCompact: Boolean = true
+        /** Context budget in tokens; compaction starts at 60% of it. Lower = cheaper requests. */
+        var contextLimitTokens: Int = 100_000
     }
 
     private var myState = State()

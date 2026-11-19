@@ -4,7 +4,6 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import ir.arvanai.PluginLog
 import java.io.File
 import java.nio.file.Files
-import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 
 /** One thing that can be imported into `.arvanai/`. */
@@ -16,7 +15,8 @@ data class InstructionItem(
 )
 
 /**
- * Moves rules / skills / memory files of other AI tools into the neutral `.arvanai/` folder.
+ * Copies rules / skills / memory files of other AI tools into the neutral `.arvanai/` folder.
+ * The originals are never moved, changed or deleted, so the other tools keep working side by side.
  * This is the only file that knows the names of those foreign tools' files.
  */
 object InstructionsImporter {
@@ -40,7 +40,7 @@ object InstructionsImporter {
     // ---- neutral targets ----
     private const val OWN = ProjectInstructions.DIR
 
-    data class ImportResult(val moved: List<InstructionItem>, val skipped: List<Pair<InstructionItem, String>>)
+    data class ImportResult(val copied: List<InstructionItem>, val skipped: List<Pair<InstructionItem, String>>)
 
     fun scan(projectDir: String): List<InstructionItem> {
         val root = File(projectDir)
@@ -57,26 +57,14 @@ object InstructionsImporter {
             !Files.isSymbolicLink(f.toPath()) && isUnder(canonRoot, f.canonicalFile)
         }.getOrDefault(false)
 
-        // memory
-        val usedTargets = mutableSetOf<File>()
-        fun memoryTarget(): File {
-            val first = File(own, GENERIC_MEMORY)
-            if (!first.exists() && first !in usedTargets) return first
-            var i = 1
-            while (true) {
-                val n = if (i == 1) "project-memory.md" else "project-memory-$i.md"
-                val t = File(own, "rules/$n")
-                if (!t.exists() && t !in usedTargets) return t
-                i++
-            }
-        }
-        for (rel in listOf(GENERIC_MEMORY, FOREIGN_MEMORY, FOREIGN_DIR_MEMORY)) {
+        // memory: fixed targets, so a file that was already copied is not offered again
+        listOf(
+            GENERIC_MEMORY to "rules/project-memory.md",
+            FOREIGN_MEMORY to "rules/project-memory-2.md",
+            FOREIGN_DIR_MEMORY to "rules/project-memory-3.md",
+        ).forEach { (rel, target) ->
             val f = File(root, rel)
-            if (f.isFile && inside(f)) {
-                val t = memoryTarget()
-                usedTargets += t
-                memory += InstructionItem("memory", f.name, f, t)
-            }
+            if (f.isFile && inside(f)) memory += InstructionItem("memory", f.name, f, File(own, target))
         }
         File(root, FOREIGN_LOCAL_MEMORY).takeIf { it.isFile && inside(it) }?.let {
             memory += InstructionItem("memory", it.name, it, File(own, "rules/local-memory.md"))
@@ -136,17 +124,18 @@ object InstructionsImporter {
             agents += InstructionItem("agent", r.removeSuffix(".md"), it, File(own, "agents/$r"))
         }
 
-        return memory + rules + skills + commands + agents
+        // Already copied (or the user has their own file there): nothing to offer.
+        return (memory + rules + skills + commands + agents).filter { !it.target.exists() }
     }
 
-    fun move(projectDir: String, items: List<InstructionItem>): ImportResult {
-        val moved = mutableListOf<InstructionItem>()
+    fun copy(projectDir: String, items: List<InstructionItem>): ImportResult {
+        val copied = mutableListOf<InstructionItem>()
         val skipped = mutableListOf<Pair<InstructionItem, String>>()
         val root = File(projectDir)
         val canonRoot = canonical(root)
         if (canonRoot == null) {
             items.forEach { skipped += it to "project root not found" }
-            return ImportResult(moved, skipped)
+            return ImportResult(copied, skipped)
         }
 
         for (item in items) {
@@ -163,21 +152,21 @@ object InstructionsImporter {
                 if (tgt.exists()) { skipped += item to "target exists"; continue }
                 tgt.parentFile?.mkdirs()
 
-                if (src.isDirectory) moveDir(src, tgt) else moveFile(src, tgt)
+                // Copy only: the source stays where it is for the tool that owns it.
+                if (src.isDirectory) copyTree(src, tgt) else Files.copy(src.toPath(), tgt.toPath(), StandardCopyOption.COPY_ATTRIBUTES)
 
                 runCatching { rewriteTree(tgt, stripCursorFrontMatter = src.extension.equals("mdc", true)) }
-                moved += item
-                PluginLog.info("import", "moved ${item.kind} ${src.path} -> ${tgt.path}")
+                copied += item
+                PluginLog.info("import", "copied ${item.kind} ${src.path} -> ${tgt.path}")
             } catch (e: Throwable) {
                 skipped += item to (e.message ?: e.javaClass.simpleName)
                 PluginLog.warn("import", "failed ${item.source.path}: ${e.message}")
             }
         }
 
-        runCatching { cleanup(root) }
-        runCatching { refresh(root, moved) }
-        PluginLog.info("import", "done: moved=${moved.size} skipped=${skipped.size}")
-        return ImportResult(moved, skipped)
+        runCatching { LocalFileSystem.getInstance().refreshIoFiles(listOf(File(root, OWN)), true, true, null) }
+        PluginLog.info("import", "done: copied=${copied.size} skipped=${skipped.size}")
+        return ImportResult(copied, skipped)
     }
 
     // ---- helpers ----
@@ -191,25 +180,7 @@ object InstructionsImporter {
         return p.startsWith(r)
     }
 
-    private fun moveFile(src: File, tgt: File) {
-        val s: Path = src.toPath()
-        val t: Path = tgt.toPath()
-        try {
-            Files.move(s, t)
-        } catch (e: Exception) {
-            Files.copy(s, t, StandardCopyOption.COPY_ATTRIBUTES)
-            Files.delete(s)
-        }
-    }
 
-    private fun moveDir(src: File, tgt: File) {
-        try {
-            Files.move(src.toPath(), tgt.toPath())
-        } catch (e: Exception) {
-            copyTree(src, tgt)
-            src.deleteRecursively()
-        }
-    }
 
     private fun copyTree(src: File, tgt: File) {
         src.walkTopDown().onEnter { !Files.isSymbolicLink(it.toPath()) }.forEach { f ->
@@ -249,31 +220,6 @@ object InstructionsImporter {
         if (text != original) f.writeText(text, Charsets.UTF_8)
     }
 
-    private fun deleteEmptyDirs(dir: File) {
-        if (!dir.isDirectory || Files.isSymbolicLink(dir.toPath())) return
-        dir.walkBottomUp().filter { it.isDirectory && !Files.isSymbolicLink(it.toPath()) }.forEach {
-            if (it.list()?.isEmpty() == true) it.delete()
-        }
-    }
 
-    private fun cleanup(root: File) {
-        listOf(FOREIGN_RULES, FOREIGN_SKILLS, FOREIGN_COMMANDS, FOREIGN_AGENTS, CURSOR_RULES_DIR).forEach {
-            deleteEmptyDirs(File(root, it))
-        }
-        listOf(FOREIGN_DIR, CURSOR_DIR).forEach {
-            val d = File(root, it)
-            if (d.isDirectory && d.list()?.isEmpty() == true) d.delete()
-        }
-    }
 
-    private fun refresh(root: File, moved: List<InstructionItem>) {
-        val files = linkedSetOf<File>()
-        files += File(root, OWN)
-        for (m in moved) {
-            var p: File? = m.source.parentFile
-            while (p != null && !p.exists()) p = p.parentFile
-            if (p != null) files += p
-        }
-        LocalFileSystem.getInstance().refreshIoFiles(files.filter { it.exists() || it == File(root, OWN) }, true, true, null)
-    }
 }

@@ -4,7 +4,9 @@
 
 | سند | موضوع |
 |---|---|
-| [arvan-api.md](arvan-api.md) | ارتباط با API هوش مصنوعی ابرآروان: درخواست، استریم، خطاها |
-| [instructions-import.md](instructions-import.md) | قوانین و اسکیل‌های `.arvanai/` و دکمهٔ انتقال |
+| [getting-started.md](getting-started.md) | **راهنمای شروع:** ساخت سرویس در ابرآروان، نصب، تنظیم، اولین گفتگو، اشکال‌یابی |
+| [chat-agent.md](chat-agent.md) | ایجنت چت: ابزارها، پیمایش کد با index IDE، graphify، حالت طرح، خلاصه‌سازی، ذخیرهٔ گفتگو، MCP، استقلال از ابزارهای دیگر |
+| [arvan-api.md](arvan-api.md) | ارتباط با API هوش مصنوعی ابرآروان: درخواست، استریم، خطاها، فهرست مدل‌ها |
+| [instructions-import.md](instructions-import.md) | قوانین و اسکیل‌های `.arvanai/` و دکمهٔ کپی |
 
 </div>
