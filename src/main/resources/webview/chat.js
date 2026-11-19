@@ -434,6 +434,9 @@
     $("infoTotal").textContent = fmtNum(u.total);
     $("infoModel").textContent = modelLabel(G.model);
     $("infoCwd").textContent = tildePath(G.projectPath);
+    $("infoCtx").textContent = c.ctx && c.ctx.limit
+      ? "~" + fmtNum(c.ctx.tokens) + " / " + fmtNum(c.ctx.limit) + " (" + Math.round((100 * c.ctx.tokens) / c.ctx.limit) + "%)"
+      : "—";
     $("infoKey").textContent = G.hasKey === null ? "—" : G.hasKey ? tr("set", "تنظیم شده") : tr("missing (Settings › Tools › ArvanAi)", "تنظیم نشده (Settings › Tools › ArvanAi)");
   }
 
@@ -463,6 +466,7 @@
   function onDone(c, p) {
     const secs = c.startedAt ? ((Date.now() - c.startedAt) / 1000).toFixed(1) + "s" : "";
     flushBlock(c);
+    closeTools(c);
     const u = p.usage;
     if (u) {
       c.usage.prompt += u.prompt_tokens || 0;
@@ -490,8 +494,122 @@
     }
   }
 
+  /** Tool rows left open when a run ends (stopped or failed) lose their spinner and approval box. */
+  function closeTools(c) {
+    c.main.el.querySelectorAll(".tool .approval").forEach((e) => e.remove());
+    c.main.el.querySelectorAll(".tool.running").forEach((e) => {
+      e.classList.remove("running");
+      e.classList.add("error");
+    });
+    c.tools = {};
+  }
+
+  // ==================================================================== agent tool calls
+  const FILE_TOOLS = { Read: 1, Edit: 1, Write: 1 };
+
+  function onToolStart(c, p) {
+    flushBlock(c);
+    const d = document.createElement("div");
+    d.className = "tool running";
+    d.innerHTML = '<div class="head"><span class="bullet">⏺</span><div class="call"><span class="name"></span><span class="arg"></span></div></div>';
+    d.querySelector(".name").textContent = p.title || "";
+    d.querySelector(".arg").textContent = p.label ? "(" + p.label + ")" : "";
+    d.querySelector(".call").title = (p.title || "") + " " + (p.label || "");
+    if (FILE_TOOLS[p.title] && p.label) {
+      const o = document.createElement("span");
+      o.className = "open";
+      o.textContent = tr("open", "باز کردن");
+      o.onclick = () => toIde({ type: "openFile", path: p.label, line: 0 });
+      d.querySelector(".call").appendChild(o);
+    }
+    turnEl(c.main).appendChild(d);
+    (c.tools = c.tools || {})[p.id] = d;
+    chatStatus(c, tr("Running ", "در حال اجرای ") + (p.title || "tool") + "…");
+    scrollDown(c.main);
+  }
+
+  function onToolApproval(c, p) {
+    const d = c.tools && c.tools[p.id];
+    if (!d) return;
+    const box = document.createElement("div");
+    box.className = "approval";
+    if (p.preview) {
+      const pre = document.createElement("pre");
+      pre.className = "preview";
+      String(p.preview).split("\n").forEach((line) => {
+        const ln = document.createElement("div");
+        if (line.startsWith("+ ")) ln.className = "add";
+        else if (line.startsWith("- ")) ln.className = "del";
+        else if (line.startsWith("$ ")) ln.className = "cmd";
+        ln.textContent = line || " ";
+        pre.appendChild(ln);
+      });
+      box.appendChild(pre);
+    }
+    const isCmd = p.kind === "command";
+    const q = document.createElement("div");
+    q.className = "q";
+    q.dir = uiDir();
+    q.textContent = isCmd ? tr("Run this command?", "این دستور اجرا شود؟") : tr("Apply this change?", "این تغییر اعمال شود؟");
+    box.appendChild(q);
+    const row = document.createElement("div");
+    row.className = "btnrow";
+    row.dir = uiDir();
+    const decide = (decision) => {
+      toIde({ type: "toolDecision", chat: c.id, id: p.id, decision });
+      box.remove();
+      chatStatus(c, decision === "deny" ? thinking() : tr("Running…", "در حال اجرا…"));
+    };
+    const btn = (label, cls, decision) => {
+      const b = document.createElement("button");
+      b.className = cls;
+      b.textContent = label;
+      b.onclick = () => decide(decision);
+      row.appendChild(b);
+      return b;
+    };
+    const first = btn(tr("Allow", "اجازه"), "primary", "allow");
+    btn(isCmd ? tr("Always allow commands (this session)", "همیشه اجازهٔ اجرای دستور (این نشست)")
+      : tr("Always allow edits (this session)", "همیشه اجازهٔ ویرایش (این نشست)"), "pillbtn", "always");
+    btn(tr("Deny", "رد"), "pillbtn", "deny");
+    if (p.hasDiff) {
+      const v = document.createElement("button");
+      v.className = "pillbtn";
+      v.textContent = tr("View diff", "نمایش diff");
+      v.onclick = () => toIde({ type: "showDiff", chat: c.id, id: p.id });
+      row.appendChild(v);
+    }
+    box.appendChild(row);
+    d.appendChild(box);
+    chatStatus(c, tr("Waiting for your approval…", "در انتظار تأیید شما…"));
+    scrollDown(c.main, true);
+    if (c === chat()) first.focus();
+  }
+
+  function onToolEnd(c, p) {
+    const d = c.tools && c.tools[p.id];
+    if (!d) return;
+    const ap = d.querySelector(".approval");
+    if (ap) ap.remove();
+    d.classList.remove("running");
+    d.classList.add(p.ok ? "done" : "error");
+    const r = document.createElement("div");
+    r.className = "result";
+    r.innerHTML = '<span class="elbow">⎿</span><div class="body"><div class="summary"></div></div>';
+    r.querySelector(".summary").textContent = p.summary || "";
+    if (p.detail) {
+      const pre = document.createElement("pre");
+      pre.textContent = p.detail;
+      r.querySelector(".body").appendChild(pre);
+    }
+    d.appendChild(r);
+    chatStatus(c, thinking());
+    scrollDown(c.main);
+  }
+
   function onError(c, text) {
     flushBlock(c);
+    closeTools(c);
     notice(c, c.main, text, "error");
     c.main.turn = null;
     c.failed = true;
@@ -1000,6 +1118,27 @@
           if (cc) onError(cc, String(p.text || ""));
           break;
         }
+        case "toolStart":
+          if (c) onToolStart(c, p);
+          break;
+        case "toolApproval":
+          if (c) onToolApproval(c, p);
+          break;
+        case "toolEnd":
+          if (c) onToolEnd(c, p);
+          break;
+        case "contextSize":
+          if (c) {
+            c.ctx = { tokens: p.tokens || 0, limit: p.limit || 0 };
+            if (c === chat()) renderInfo();
+          }
+          break;
+        case "status":
+          if (c) chatStatus(c, String(p.text || ""));
+          break;
+        case "notice":
+          if (c) notice(c, c.main, String(p.text || ""), p.kind || "");
+          break;
         case "fileResults":
           showMention(p);
           break;

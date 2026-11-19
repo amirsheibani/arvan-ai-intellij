@@ -1,6 +1,8 @@
 package ir.arvanai.settings
 
+import com.intellij.ide.impl.ProjectUtil
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.options.BoundConfigurable
 import com.intellij.openapi.ui.DialogPanel
 import com.intellij.ui.SimpleListCellRenderer
@@ -12,6 +14,7 @@ import com.intellij.ui.dsl.builder.bindSelected
 import com.intellij.ui.dsl.builder.bindText
 import com.intellij.ui.dsl.builder.panel
 import ir.arvanai.I18n.tr
+import ir.arvanai.ide.AgentSetup
 
 class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
 
@@ -58,6 +61,66 @@ class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
                     .align(AlignX.FILL)
                     .bindText(s::httpsProxy)
                     .comment(tr("Optional, e.g. http://127.0.0.1:10809", "اختیاری، مثال: http://127.0.0.1:10809"))
+            }
+        }
+        group(tr("Chat Agent", "ایجنت چت")) {
+            row {
+                checkBox(tr("Let the assistant use tools (read and search files, edit, run commands)", "اجازهٔ استفاده از ابزار به دستیار (خواندن و جستجوی فایل، ویرایش، اجرای دستور)"))
+                    .bindSelected(s::agentTools)
+                    .comment(tr("The model must support function calling (tools).", "مدل باید از function calling (tools) پشتیبانی کند."))
+            }
+            row {
+                checkBox(tr("Apply file edits without asking", "اعمال ویرایش فایل‌ها بدون پرسیدن"))
+                    .bindSelected(s::autoApproveEdits)
+            }
+            row {
+                checkBox(tr("Open the IDE diff viewer when an edit waits for approval", "باز کردن diff viewer خود IDE وقتی ویرایشی منتظر تأیید است"))
+                    .bindSelected(s::showDiffOnApproval)
+            }
+            row {
+                checkBox(tr("Run shell commands without asking", "اجرای دستورهای shell بدون پرسیدن"))
+                    .bindSelected(s::autoApproveCommands)
+            }
+            row(tr("Max steps per message:", "حداکثر گام در هر پیام:")) {
+                intTextField(1..200).bindIntText(s::maxAgentSteps)
+            }
+            row {
+                checkBox(tr("Compact the conversation automatically when it gets long", "خلاصه‌سازی خودکار گفتگو وقتی طولانی می‌شود"))
+                    .bindSelected(s::autoCompact)
+            }
+            row(tr("Context budget (tokens):", "بودجهٔ context (توکن):")) {
+                intTextField(8_000..2_000_000).bindIntText(s::contextLimitTokens)
+                    .comment(tr(
+                        "Old tool outputs are dropped at 60% and older messages are summarized at 80%. Lower = cheaper. /compact does it now.",
+                        "در ۶۰٪ خروجی ابزارهای قدیمی حذف و در ۸۰٪ پیام‌های قدیمی خلاصه می‌شوند. عدد کمتر = هزینهٔ کمتر. /compact همین الان انجام می‌دهد.",
+                    ))
+            }
+        }
+        group(tr("Terminal Agent (Aider)", "ایجنت ترمینال (Aider)")) {
+            row(tr("Agent model:", "مدل ایجنت:")) {
+                textField()
+                    .bindText(s::agentModel)
+                    .comment(
+                        tr(
+                            "Empty = same as the chat model. During an internet outage, use a model hosted inside Iran.",
+                            "خالی = همان مدل چت. هنگام قطعی اینترنت، مدلی را بگذارید که داخل ایران میزبانی می‌شود.",
+                        )
+                    )
+            }
+            row {
+                checkBox(tr("Offer the agent setup when opening a project", "پیشنهاد راه‌اندازی ایجنت هنگام باز کردن پروژه"))
+                    .bindSelected(s::agentSetupPrompt)
+            }
+            row {
+                button(tr("Set Up Agent for Current Project", "راه‌اندازی ایجنت برای پروژهٔ فعلی")) {
+                    val project = ProjectUtil.getActiveProject() ?: ProjectManager.getInstance().openProjects.firstOrNull()
+                    if (project != null) AgentSetup.run(project)
+                }.comment(
+                    tr(
+                        "Installs Aider and graphify with uv if missing (needs internet), writes .aider.conf.yml, and builds the code graph. Open it with Tools › ArvanAi: Open Agent.",
+                        "اگر Aider و graphify نصب نباشند با uv نصب می‌کند (نیاز به اینترنت)، .aider.conf.yml را می‌سازد و گراف کد را تولید می‌کند. اجرا: Tools › ArvanAi: باز کردن ایجنت.",
+                    )
+                )
             }
         }
         group(tr("Context", "زمینه (context)")) {

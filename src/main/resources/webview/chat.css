@@ -263,6 +263,14 @@ kbd { font-family: var(--mono); font-size: 0.85em; border: 1px solid var(--borde
 .tool .result .summary, .tool .todos .t { text-align: left; }
 .tool.error .result .summary { color: var(--danger); }
 .tool .result pre { margin: 0; font-family: var(--mono); font-size: 0.95em; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+
+/* approval box under a tool row (edit diff / command) */
+.tool .approval { margin: 4px 0 6px 1.6em; padding: 6px 10px; border: 1px solid var(--accent); border-radius: 8px; }
+.tool .approval .preview { margin: 0 0 6px; max-height: 320px; overflow: auto; font-family: var(--mono); font-size: 0.85em; line-height: 1.5; background: var(--code-bg); border-radius: 6px; padding: 4px 8px; white-space: pre-wrap; word-break: break-all; }
+.tool .approval .preview .add { color: var(--ok); }
+.tool .approval .preview .del { color: var(--danger); }
+.tool .approval .preview .cmd { font-weight: 700; }
+.tool .approval .q { margin: 2px 0 4px; font-size: 0.9em; text-align: start; }
 .tool .result .more { display: block; color: var(--dim); cursor: pointer; font-family: var(--font); text-align: left; }
 .diff { direction: ltr; text-align: left; font-family: var(--mono); font-size: 0.95em; line-height: 1.5; margin-top: 2px; overflow-x: auto; }
 .diff .ln { white-space: pre; display: flex; }

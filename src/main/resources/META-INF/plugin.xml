@@ -24,6 +24,9 @@
          JBCefApp/JBCefBrowser are not visible to our class loader. Optional so older IDEs
          (where JCEF is part of the core) still load the plugin. -->
     <depends optional="true" config-file="arvanai-jcef.xml">com.intellij.modules.jcef</depends>
+    <!-- The "Open Agent" action opens Aider in an IDE terminal tab; without the Terminal plugin
+         the rest of the plugin (chat, agent setup) still works. -->
+    <depends optional="true" config-file="arvanai-terminal.xml">org.jetbrains.plugins.terminal</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <toolWindow id="ArvanAi"
@@ -39,6 +42,8 @@
                                  displayName="ArvanAi"/>
 
         <notificationGroup id="ArvanAi" displayType="BALLOON"/>
+
+        <postStartupActivity implementation="ir.arvanai.ide.AgentStartupActivity"/>
     </extensions>
 
     <actions>

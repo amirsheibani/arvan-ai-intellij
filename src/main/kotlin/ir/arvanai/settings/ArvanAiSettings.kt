@@ -33,6 +33,26 @@ class ArvanAiSettings : PersistentStateComponent<ArvanAiSettings.State> {
         var httpsProxy: String = ""
         var fontSize: Int = 14
         var sendOnEnter: Boolean = true
+
+        /** Chat works as an agent: the model may call tools (read/search files, edit, run commands). */
+        var agentTools: Boolean = true
+        /** Apply file edits without asking. */
+        var autoApproveEdits: Boolean = false
+        /** Run shell commands without asking. */
+        var autoApproveCommands: Boolean = false
+        /** Open IntelliJ's diff viewer automatically when an edit waits for approval. */
+        var showDiffOnApproval: Boolean = true
+        /** Maximum model requests (tool rounds) per message. */
+        var maxAgentSteps: Int = 40
+        /** Compact the conversation automatically when it gets close to [contextLimitTokens]. */
+        var autoCompact: Boolean = true
+        /** Context budget in tokens; compaction starts at 60% of it. Lower = cheaper requests. */
+        var contextLimitTokens: Int = 100_000
+
+        /** Model for the terminal agent (Aider); empty = same as [model]. */
+        var agentModel: String = ""
+        /** Offer to set up the agent when a project that is not set up yet is opened. */
+        var agentSetupPrompt: Boolean = true
     }
 
     private var myState = State()

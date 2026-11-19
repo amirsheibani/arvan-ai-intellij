@@ -12,6 +12,7 @@ object SlashCommands {
         get() = listOf(
             Command("clear", I18n.tr("Start a new conversation", "شروع گفتگوی جدید"), "builtin"),
             Command("new", I18n.tr("Start a new conversation", "شروع گفتگوی جدید"), "builtin"),
+            Command("compact", I18n.tr("Summarize the conversation to free context (optional: what to focus on)", "خلاصه کردن گفتگو برای آزاد کردن context (اختیاری: روی چه چیزی تمرکز شود)"), "builtin"),
         )
 
     /** Built-ins plus the skills found in `.arvanai/` (project and user). Blocking file I/O: call off the EDT. */

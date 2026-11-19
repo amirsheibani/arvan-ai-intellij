@@ -11,7 +11,11 @@ import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.diff.DiffContentFactory
+import com.intellij.diff.DiffManager
+import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.openapi.command.WriteCommandAction
+import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
@@ -31,10 +35,14 @@ import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.ui.UIUtil
+import com.intellij.openapi.util.SystemInfo
 import ir.arvanai.I18n
 import ir.arvanai.PluginLog
+import ir.arvanai.agent.AgentTools
 import ir.arvanai.api.ArvanClient
+import ir.arvanai.chat.ChatMessage
 import ir.arvanai.chat.Conversation
+import ir.arvanai.chat.ToolCall
 import ir.arvanai.chat.Prompts
 import ir.arvanai.context.InstructionsImporter
 import ir.arvanai.context.ProjectInstructions
@@ -50,7 +58,10 @@ import java.awt.Color
 import java.awt.datatransfer.StringSelection
 import java.io.File
 import java.util.Base64
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ConcurrentLinkedQueue
 import javax.swing.JComponent
@@ -61,13 +72,30 @@ import javax.swing.JComponent
  */
 class ChatPanel(private val project: Project) : Disposable {
 
-    /** One request in flight. [finished] makes sure it is finalized exactly once (reply, error or stop). */
+    /**
+     * One user message being answered: one or more model requests with tool calls in between.
+     * [finished] makes sure it is finalized exactly once (reply, error or stop).
+     */
     private class Turn(val chat: String) {
+        /** Text streamed in the current step (reset at every model request). */
         val partial = StringBuilder()
         val finished = AtomicBoolean(false)
 
         @Volatile
         var handle: ArvanClient.Handle? = null
+
+        /** Lets Stop kill a running command. */
+        val run = AgentTools.RunContext()
+
+        /** Tool calls waiting for the user's Allow / Deny, by call id. */
+        val approvals = ConcurrentHashMap<String, CompletableFuture<String>>()
+
+        /** The edits behind [approvals], so the page can ask for their diff. */
+        val pendingEdits = ConcurrentHashMap<String, AgentTools.Prepared>()
+
+        @Volatile
+        var steps = 0
+        val usage = LongArray(3) // prompt, completion, total
     }
 
     private val gson = Gson()
@@ -82,6 +110,14 @@ class ChatPanel(private val project: Project) : Disposable {
     private val conversations = ConcurrentHashMap<String, Conversation>()
     private val turns = ConcurrentHashMap<String, Turn>()
     private val tracker = SelectionTracker.getInstance(project)
+    private val agentTools by lazy { AgentTools(project) }
+
+    /** Tool kinds the user allowed for the rest of this IDE session ("Always allow"). */
+    private val sessionApproved: MutableSet<AgentTools.Kind> = ConcurrentHashMap.newKeySet()
+
+    /** Set when the server rejected the `tools` field; later requests are sent as plain chat. */
+    @Volatile
+    private var toolsUnsupported = false
     private val logListener: (PluginLog.Line) -> Unit = { post("logLine", lineJson(it)) }
 
     val component: JComponent get() = browser.component
@@ -184,9 +220,12 @@ class ChatPanel(private val project: Project) : Disposable {
                 sendMessage(chat, text, bool("shareContext", true), bool("expandRefs", true))
             }
             "stop" -> stopTurn(chat)
+            "toolDecision" -> turns[chat]?.approvals?.get(str("id"))?.complete(str("decision"))
+            "showDiff" -> turns[chat]?.pendingEdits?.get(str("id"))?.let { p -> pooled { showDiff(p) } }
             "clearChat" -> {
                 stopTurn(chat)
                 conversations[chat]?.reset()
+                post("contextSize", chatJson(chat).apply { addProperty("tokens", 0); addProperty("limit", contextLimit()) })
             }
             "closeChat" -> {
                 stopTurn(chat)
@@ -259,6 +298,11 @@ class ChatPanel(private val project: Project) : Disposable {
         pooled(onFail = { finishTurn(turn) { post("error", chatJson(chat).apply { addProperty("text", I18n.tr("Could not send the message.", "ارسال پیام ناموفق بود.")) }) } }) {
             val s = ArvanAiSettings.get()
             val base = project.basePath
+            val trimmed = rawText.trim()
+            if (trimmed == "/compact" || trimmed.startsWith("/compact ") || trimmed.startsWith("/compact\n")) {
+                compactCommand(turn, conv, trimmed.removePrefix("/compact").trim())
+                return@pooled
+            }
             // "/skill args" becomes the skill's instructions; other text keeps the IDE context.
             var text = rawText
             var isSkill = false
@@ -278,28 +322,319 @@ class ChatPanel(private val project: Project) : Disposable {
 
             if (turn.finished.get()) return@pooled
             conv.addUser(text)
-            val system = buildSystemPrompt()
-            val messages = conv.snapshot(system)
             post("busy", chatJson(chat).apply { addProperty("busy", true) })
-            turn.handle = ArvanClient.send(messages, object : ArvanClient.Listener {
-                override fun onDelta(text: String) {
+            step(turn, conv)
+        }
+    }
+
+    /**
+     * One model request. If the reply asks for tools they are run (with approval when needed), their results are
+     * added to the conversation and the next request is sent; a reply without tool calls ends the turn.
+     */
+    private fun step(turn: Turn, conv: Conversation) {
+        if (turn.finished.get()) return
+        val s = ArvanAiSettings.get()
+        val useTools = s.agentTools && !toolsUnsupported
+        val chat = turn.chat
+        turn.partial.setLength(0)
+        turn.steps++
+        val system = buildSystemPrompt(useTools)
+        if (s.autoCompact) maybeCompact(turn, conv, system)
+        if (turn.finished.get()) return
+        val messages = conv.snapshot(system)
+        postContextSize(chat, conv, messages)
+        turn.handle = ArvanClient.send(messages, if (useTools) agentTools.definitions() else null, object : ArvanClient.Listener {
+            override fun onDelta(text: String) {
+                if (turn.finished.get()) return
+                turn.partial.append(text)
+                post("delta", chatJson(chat).apply { addProperty("text", text) })
+            }
+
+            override fun onDone(reply: ArvanClient.Reply) {
+                if (turn.finished.get()) return
+                addUsage(turn, reply.usage)
+                reply.usage?.get("prompt_tokens")?.takeIf { it.isJsonPrimitive }?.let { runCatching { conv.calibrate(messages, it.asLong) } }
+                if (!useTools || reply.toolCalls.isEmpty()) {
+                    finishTurn(turn) {
+                        conv.addAssistant(reply.text)
+                        post("done", chatJson(chat).apply { add("usage", turnUsage(turn)) })
+                    }
+                    return
+                }
+                synchronized(turn) {
                     if (turn.finished.get()) return
-                    turn.partial.append(text)
-                    post("delta", chatJson(chat).apply { addProperty("text", text) })
+                    conv.addAssistant(reply.text, reply.toolCalls)
+                    turn.partial.setLength(0)
                 }
-
-                override fun onDone(fullText: String, usage: JsonObject?) = finishTurn(turn) {
-                    conv.addAssistant(fullText)
-                    post("done", chatJson(chat).apply { usage?.let { add("usage", usageJson(it)) } })
+                PluginLog.info("agent", "step ${turn.steps}: " + reply.toolCalls.joinToString { it.name })
+                for (call in reply.toolCalls) {
+                    if (turn.finished.get()) return
+                    val result = executeTool(turn, call)
+                    synchronized(turn) {
+                        if (turn.finished.get()) return
+                        conv.addToolResult(call.id, result)
+                    }
                 }
+                if (turn.steps >= s.maxAgentSteps.coerceAtLeast(1)) {
+                    finishTurn(turn) {
+                        post("notice", chatJson(chat).apply {
+                            addProperty("kind", "warn")
+                            addProperty("text", I18n.tr(
+                                "Stopped after ${turn.steps} steps (limit in Settings). Send \"continue\" to go on.",
+                                "پس از ${turn.steps} گام متوقف شد (محدودیت در تنظیمات). برای ادامه بنویسید «ادامه بده».",
+                            ))
+                        })
+                        post("done", chatJson(chat).apply { add("usage", turnUsage(turn)) })
+                    }
+                    return
+                }
+                step(turn, conv)
+            }
 
-                override fun onError(message: String) = finishTurn(turn) {
-                    if (turn.partial.isNotEmpty()) conv.addAssistant(turn.partial.toString()) else conv.dropLastUser()
+            override fun onError(message: String, status: Int) {
+                if (turn.finished.get()) return
+                val toolsRejected = useTools && turn.steps == 1 && status in setOf(400, 422) &&
+                    Regex("tool|function", RegexOption.IGNORE_CASE).containsMatchIn(message)
+                if (toolsRejected) {
+                    toolsUnsupported = true
+                    PluginLog.warn("agent", "Server rejected tools; continuing without them")
+                    post("notice", chatJson(chat).apply {
+                        addProperty("kind", "warn")
+                        addProperty("text", I18n.tr(
+                            "This model or server does not accept tools, so the assistant cannot read project files itself. Continuing as a plain chat.",
+                            "این مدل یا سرور از ابزار (tools) پشتیبانی نمی‌کند، پس دستیار نمی‌تواند خودش فایل‌های پروژه را بخواند. ادامه به‌صورت چت ساده.",
+                        ))
+                    })
+                    turn.steps = 0
+                    step(turn, conv)
+                    return
+                }
+                finishTurn(turn) {
+                    synchronized(turn) {
+                        conv.closeDanglingToolCalls("Error: the run ended before this tool call finished.")
+                        if (turn.partial.isNotEmpty()) conv.addAssistant(turn.partial.toString()) else conv.dropLastUser()
+                    }
                     post("error", chatJson(chat).apply { addProperty("text", message) })
                 }
+            }
+        })
+        // The user may have pressed Stop while the request was being set up.
+        if (turn.finished.get()) turn.handle?.cancel()
+    }
+
+    // ---------------------------------------------------------------- context compaction
+
+    private fun contextLimit(): Long = ArvanAiSettings.get().contextLimitTokens.toLong().coerceAtLeast(MIN_CONTEXT_LIMIT)
+
+    private fun postContextSize(chat: String, conv: Conversation, messages: List<ChatMessage>) =
+        post("contextSize", chatJson(chat).apply {
+            addProperty("tokens", conv.estimateTokens(messages))
+            addProperty("limit", contextLimit())
+        })
+
+    private fun chatNotice(chat: String, text: String, kind: String = "") = post("notice", chatJson(chat).apply {
+        addProperty("kind", kind)
+        addProperty("text", text)
+    })
+
+    /**
+     * Keeps the request under the context limit. First (no request needed) the output of old tool calls is dropped;
+     * if that is not enough, the messages before the current question are summarized by the model.
+     */
+    private fun maybeCompact(turn: Turn, conv: Conversation, system: String) {
+        val limit = contextLimit()
+        fun est() = conv.estimateTokens(conv.snapshot(system))
+        val start = est()
+        if (start < limit * 6 / 10) return
+        val pruned = conv.pruneToolResults(keepLast = KEEP_TOOL_RESULTS)
+        if (est() >= limit * 8 / 10 && !summarize(turn, conv, "", auto = true)) {
+            // Nothing older to summarize (one long agent run): keep only the latest tool outputs.
+            conv.pruneToolResults(keepLast = 2)
+        }
+        val end = est()
+        if (pruned > 0 && end < start && !turn.finished.get()) {
+            PluginLog.info("agent", "context pruned: ~$start -> ~$end tokens")
+            chatNotice(turn.chat, I18n.tr(
+                "⎿  Context compacted: ~${start / 1000}k → ~${end / 1000}k tokens (older tool outputs removed).",
+                "⎿  context فشرده شد: ~${start / 1000}k ← ~${end / 1000}k توکن (خروجی ابزارهای قدیمی حذف شد).",
+            ))
+        }
+    }
+
+    /** Replaces the messages before the latest question with a model-written summary. False if nothing was done. */
+    private fun summarize(turn: Turn, conv: Conversation, focus: String, auto: Boolean): Boolean {
+        val older = conv.compactable()
+        if (older.isEmpty() || turn.finished.get()) return false
+        val before = conv.estimateTokens(conv.snapshot(""))
+        post("status", chatJson(turn.chat).apply { addProperty("text", I18n.tr("Compacting conversation…", "در حال خلاصه‌سازی گفتگو…")) })
+        PluginLog.info("agent", "compacting ${older.size} messages (auto=$auto)")
+        val request = listOf(
+            ChatMessage("system", Prompts.COMPACT_SYSTEM),
+            ChatMessage("user", Prompts.compactRequest(conv.summary, older, focus)),
+        )
+        val summary = complete(turn, request)?.takeIf { it.isNotBlank() } ?: return false
+        synchronized(turn) {
+            if (turn.finished.get()) return false
+            conv.applySummary(summary, older.size)
+        }
+        val after = conv.estimateTokens(conv.snapshot(""))
+        chatNotice(turn.chat, I18n.tr(
+            "⎿  Conversation compacted: ${older.size} older messages → summary (~${before / 1000}k → ~${after / 1000}k tokens).",
+            "⎿  گفتگو خلاصه شد: ${older.size} پیام قدیمی ← خلاصه (~${before / 1000}k ← ~${after / 1000}k توکن).",
+        ))
+        return true
+    }
+
+    /** A blocking request without tools; null on error or Stop. Runs on the turn's background thread. */
+    private fun complete(turn: Turn, messages: List<ChatMessage>): String? {
+        val result = CompletableFuture<String?>()
+        turn.handle = ArvanClient.send(messages, null, object : ArvanClient.Listener {
+            override fun onDelta(text: String) = Unit
+
+            override fun onDone(reply: ArvanClient.Reply) {
+                addUsage(turn, reply.usage)
+                result.complete(reply.text)
+            }
+
+            override fun onError(message: String, status: Int) {
+                PluginLog.warn("agent", "compaction failed: HTTP $status")
+                if (!turn.finished.get()) chatNotice(turn.chat, I18n.tr("Could not compact the conversation: ", "خلاصه‌سازی گفتگو ناموفق بود: ") + message, "warn")
+                result.complete(null)
+            }
+        })
+        while (!turn.finished.get()) {
+            try {
+                return result.get(500, TimeUnit.MILLISECONDS)
+            } catch (_: TimeoutException) {
+            }
+        }
+        turn.handle?.cancel()
+        return null
+    }
+
+    /** `/compact [focus]`: summarize the conversation now. */
+    private fun compactCommand(turn: Turn, conv: Conversation, focus: String) {
+        val chat = turn.chat
+        post("busy", chatJson(chat).apply { addProperty("busy", true) })
+        val done = summarize(turn, conv, focus, auto = false)
+        val pruned = if (done) 0 else conv.pruneToolResults(keepLast = 0)
+        finishTurn(turn) {
+            if (!done) chatNotice(chat, if (pruned > 0) I18n.tr("⎿  Removed old tool outputs.", "⎿  خروجی ابزارهای قدیمی حذف شد.")
+                else I18n.tr("⎿  Nothing to compact yet.", "⎿  هنوز چیزی برای خلاصه کردن نیست."))
+            postContextSize(chat, conv, conv.snapshot(buildSystemPrompt(ArvanAiSettings.get().agentTools && !toolsUnsupported)))
+            post("done", chatJson(chat).apply { add("usage", turnUsage(turn)) })
+        }
+    }
+
+    /** Shows the call in the chat, asks for approval if needed, runs it and returns the text for the model. */
+    private fun executeTool(turn: Turn, call: ToolCall): String {
+        val chat = turn.chat
+        val p = agentTools.prepare(call)
+        post("toolStart", chatJson(chat).apply {
+            addProperty("id", call.id)
+            addProperty("title", p.title)
+            addProperty("label", p.label)
+        })
+        val s = ArvanAiSettings.get()
+        val needsApproval = when (p.kind) {
+            AgentTools.Kind.READ -> false
+            AgentTools.Kind.EDIT -> !s.autoApproveEdits && p.kind !in sessionApproved
+            AgentTools.Kind.COMMAND -> !s.autoApproveCommands && p.kind !in sessionApproved
+        }
+        if (needsApproval) {
+            val f = CompletableFuture<String>()
+            turn.approvals[call.id] = f
+            if (p.proposed != null) turn.pendingEdits[call.id] = p
+            if (turn.finished.get()) f.complete("deny")
+            post("toolApproval", chatJson(chat).apply {
+                addProperty("id", call.id)
+                addProperty("kind", p.kind.name.lowercase())
+                addProperty("preview", p.preview.orEmpty())
+                addProperty("hasDiff", p.proposed != null)
             })
-            // The user may have pressed Stop while the request was being set up.
-            if (turn.finished.get()) turn.handle?.cancel()
+            if (p.proposed != null && s.showDiffOnApproval) showDiff(p)
+            val decision = try {
+                f.get()
+            } catch (e: Exception) {
+                "deny"
+            } finally {
+                turn.approvals.remove(call.id)
+                turn.pendingEdits.remove(call.id)
+            }
+            if (turn.finished.get()) return "Cancelled: the user stopped the run."
+            when (decision) {
+                "always" -> sessionApproved += p.kind
+                "allow" -> Unit
+                else -> {
+                    toolEnd(chat, call.id, false, I18n.tr("Denied by you", "رد شد"), null)
+                    return "The user denied this tool call. Do not retry it unchanged; ask the user or take another approach."
+                }
+            }
+        }
+        val r = try {
+            p.run(turn.run)
+        } catch (e: Throwable) {
+            PluginLog.warn("agent", "${call.name} failed: ${e.javaClass.simpleName}")
+            AgentTools.Result(false, "Error: ${e.message ?: e.javaClass.simpleName}", e.message ?: e.javaClass.simpleName)
+        }
+        toolEnd(chat, call.id, r.ok, r.summary, r.detail)
+        val text = r.forModel
+        return if (text.length > MAX_TOOL_RESULT) text.take(MAX_TOOL_RESULT) + "\n… (output truncated)" else text
+    }
+
+    /** Opens IntelliJ's diff viewer: the file now vs. the file after the proposed edit. Call off the EDT. */
+    private fun showDiff(p: AgentTools.Prepared) {
+        val pair = try {
+            p.proposed?.invoke()
+        } catch (e: Exception) {
+            null
+        }
+        if (pair == null) {
+            notify(I18n.tr("The proposed change no longer matches the file, so there is no diff to show.",
+                "تغییر پیشنهادی دیگر با فایل جور نیست، پس diff قابل نمایش نیست."), NotificationType.WARNING)
+            return
+        }
+        val name = p.label.substringAfterLast('/')
+        ApplicationManager.getApplication().invokeLater {
+            if (project.isDisposed) return@invokeLater
+            val type = FileTypeManager.getInstance().getFileTypeByFileName(name)
+            val factory = DiffContentFactory.getInstance()
+            val request = SimpleDiffRequest(
+                I18n.tr("ArvanAi: proposed change to ", "ArvanAi: تغییر پیشنهادی در ") + p.label,
+                factory.create(project, pair.first, type),
+                factory.create(project, pair.second, type),
+                I18n.tr("Current", "فعلی"),
+                I18n.tr("Proposed", "پیشنهادی"),
+            )
+            DiffManager.getInstance().showDiff(project, request)
+        }
+    }
+
+    private fun toolEnd(chat: String, id: String, ok: Boolean, summary: String, detail: String?) =
+        post("toolEnd", chatJson(chat).apply {
+            addProperty("id", id)
+            addProperty("ok", ok)
+            addProperty("summary", summary)
+            detail?.let { addProperty("detail", it) }
+        })
+
+    private fun addUsage(turn: Turn, u: JsonObject?) {
+        if (u == null) return
+        fun n(k: String) = u.get(k)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asLong ?: 0L
+        val p = n("prompt_tokens")
+        val c = n("completion_tokens")
+        synchronized(turn.usage) {
+            turn.usage[0] += p
+            turn.usage[1] += c
+            turn.usage[2] += n("total_tokens").takeIf { it > 0 } ?: (p + c)
+        }
+    }
+
+    private fun turnUsage(turn: Turn) = JsonObject().apply {
+        synchronized(turn.usage) {
+            addProperty("prompt_tokens", turn.usage[0])
+            addProperty("completion_tokens", turn.usage[1])
+            addProperty("total_tokens", turn.usage[2])
         }
     }
 
@@ -317,9 +652,14 @@ class ChatPanel(private val project: Project) : Disposable {
     private fun stopTurn(chat: String) {
         val turn = turns[chat] ?: return
         turn.handle?.cancel()
+        turn.run.cancel()
+        turn.approvals.values.forEach { it.complete("deny") }
         finishTurn(turn) {
             val conv = conversation(chat)
-            if (turn.partial.isNotEmpty()) conv.addAssistant(turn.partial.toString()) else conv.dropLastUser()
+            synchronized(turn) {
+                conv.closeDanglingToolCalls("Cancelled: the user stopped the run.")
+                if (turn.partial.isNotEmpty()) conv.addAssistant(turn.partial.toString()) else conv.dropLastUser()
+            }
             post("done", chatJson(chat).apply { addProperty("stopped", true) })
         }
     }
@@ -331,14 +671,31 @@ class ChatPanel(private val project: Project) : Disposable {
         }
     }
 
-    /** Language prompt + project rules + the user's own extra prompt. Built fresh for every request. */
-    private fun buildSystemPrompt(): String {
+    /** Agent prompt + language prompt + project rules + the user's own extra prompt. Built fresh for every request. */
+    private fun buildSystemPrompt(useTools: Boolean): String {
         val s = ArvanAiSettings.get()
         return listOf(
+            if (useTools) Prompts.agentPrompt(
+                project.basePath ?: "",
+                topLevelListing(),
+                "${SystemInfo.OS_NAME} ${SystemInfo.OS_VERSION}",
+                canEdit = true,
+                canRun = true,
+            ) else "",
             if (s.matchReplyLanguage) Prompts.languagePrompt(I18n.lang) else "",
             ProjectInstructions.systemPrompt(project.basePath),
             s.systemPrompt.trim(),
         ).filter { it.isNotBlank() }.joinToString("\n\n")
+    }
+
+    /** Names in the project root (directories end with /), so the model knows the layout without a tool call. */
+    private fun topLevelListing(): String {
+        val dir = project.basePath?.let { File(it) } ?: return "(unknown)"
+        val entries = (dir.listFiles() ?: return "(unreadable)")
+            .filter { it.name != ".git" && it.name != ".DS_Store" }
+            .sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        return entries.take(150).joinToString("\n") { if (it.isDirectory) it.name + "/" else it.name } +
+            if (entries.size > 150) "\n… ${entries.size - 150} more" else ""
     }
 
     /** Appends the content of `@path/File.ext[#L1-9]` references that point at small text files inside the project. */
@@ -567,7 +924,12 @@ class ChatPanel(private val project: Project) : Disposable {
 
     override fun dispose() {
         PluginLog.removeListener(logListener)
-        turns.values.forEach { it.finished.set(true); it.handle?.cancel() }
+        turns.values.forEach { t ->
+            t.finished.set(true)
+            t.handle?.cancel()
+            t.run.cancel()
+            t.approvals.values.forEach { it.complete("deny") }
+        }
         turns.clear()
         conversations.clear()
         ChatPanelHolder.getInstance(project).let { if (it.panel === this) it.panel = null }
@@ -580,5 +942,9 @@ class ChatPanel(private val project: Project) : Disposable {
         private const val MAX_INPUT_CHARS = 200_000
         private const val MAX_REF_FILES = 5
         private const val MAX_REF_BYTES = 200_000L
+        private const val MAX_TOOL_RESULT = 60_000
+        private const val MIN_CONTEXT_LIMIT = 8_000L
+        /** Tool outputs kept in full when old ones are pruned. */
+        private const val KEEP_TOOL_RESULTS = 6
     }
 }
