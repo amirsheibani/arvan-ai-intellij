@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ArvanAi</title>
+  <style>
+/*__CSS__*/
+  </style>
+</head>
+<body>
+  <!-- chat tabs (one conversation per tab) -->
+  <header id="topbar">
+    <div class="tabs" id="chatTabs"></div>
+    <div class="actions">
+      <button id="btnNewChat" class="icon" title="New chat"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
+      <button id="btnSettings" class="icon" title="Settings"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
+    </div>
+  </header>
+  <main id="views">
+    <section id="view-chat" class="view">
+      <div id="searchBar" class="searchbar hidden">
+        <input id="searchInput" placeholder="Search in chat… (Enter: next)" dir="auto">
+        <button id="searchPrev" class="icon" title="Previous"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg></button>
+        <button id="searchNext" class="icon" title="Next"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+        <button id="searchClose" class="icon" title="Close"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+      </div>
+      <div id="chatLogs"></div>
+    </section>
+    <section id="view-git" class="view hidden"></section>
+    <section id="view-log" class="view hidden"></section>
+    <section id="view-skills" class="view hidden"></section>
+    <section id="view-rules" class="view hidden"></section>
+  </main>
+
+  <div id="status" class="status hidden">
+    <span class="spin" id="spin">✻</span><span id="statusText">Thinking…</span>
+    <span class="hint" id="statusHint"></span>
+  </div>
+
+  <section id="info" class="info" dir="ltr">
+    <div><span class="k">Model:</span> <span class="v" id="infoModel">—</span></div>
+    <div class="wide"><span class="k">Working dir:</span> <span class="v" id="infoCwd">—</span></div>
+    <div><span class="k">API key:</span> <span class="v" id="infoKey">—</span></div>
+    <div><span class="state" id="infoState"><span class="sdot"></span><span id="infoStateText">Idle</span></span></div>
+    <div><span class="k">Prompt</span> <span class="v" id="infoPrompt">0</span> · <span class="k">Reply</span> <span class="v" id="infoOut">0</span> · <span class="k">Total</span> <span class="v" id="infoTotal">0</span></div>
+  </section>
+
+  <div id="mention" class="popup hidden" dir="ltr"></div>
+  <div id="slash" class="popup hidden" dir="ltr"></div>
+
+  <footer id="composer">
+    <div class="card">
+      <div class="ctabs">
+        <div class="tabrow" id="viewTabs">
+          <button class="vt active" data-view="chat">Chat</button>
+          <button class="vt" data-view="git">Git</button>
+          <button class="vt" data-view="log">Log</button>
+          <button class="vt" data-view="skills">Skills</button>
+          <button class="vt" data-view="rules">Rules</button>
+        </div>
+        <div class="tabicons">
+          <button id="btnNewChat2" class="icon" title="New chat"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
+          <button id="btnSearch" class="icon" title="Search in chat"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg></button>
+          <button id="btnGit" class="icon" title="Git"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></button>
+          <button id="btnMore" class="icon" title="More"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button>
+        </div>
+      </div>
+      <textarea id="input" dir="auto" rows="2" placeholder="Ask ArvanAi, or type / for skills and @ for files"></textarea>
+      <div class="toolbar">
+        <div class="group">
+          <button id="btnAttach" class="tb" title="Add files, folders or images"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
+          <span class="sep"></span>
+          <button id="ddModel" class="tb dd" title="Model"><span class="ic"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/></svg></span><span class="lbl" dir="ltr"></span><span class="car"><svg class="ico car-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></button>
+        </div>
+        <div class="group">
+          <button id="ctxChip" class="chip hidden" title=""></button>
+          <button id="btnMore2" class="tb" title="More"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button>
+          <button id="btnLang" class="tb lang" title="Language"><span class="ic"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span><span class="lbl">EN</span></button>
+          <button id="btnSend" class="send" title="Send (Enter)"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></svg></button>
+          <button id="btnStop" class="stop hidden" title="Stop (Esc)"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="12" height="12" x="6" y="6" rx="2" fill="currentColor"/></svg></button>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <div id="menu" class="menu hidden"></div>
+
+  <template id="tplWelcome">
+    <div class="welcome-wrap">
+      <div class="welcome">
+        <div class="title"><svg class="logo" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M4 3h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-8l-5 4v-4H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" fill="none" stroke="#1F9DB4" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.2 14 12 6l3.8 8M9.6 11.6h4.8" fill="none" stroke="#1F9DB4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="wt"></span></div>
+        <div class="cwd"></div>
+      </div>
+      <div class="tips"></div>
+    </div>
+  </template>
+
+  <script>
+/*__JS__*/
+  </script>
+</body>
+</html>

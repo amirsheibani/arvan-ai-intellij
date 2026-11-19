@@ -1,0 +1,78 @@
+<idea-plugin>
+    <id>ir.arvanai.intellij</id>
+    <name>ArvanAi</name>
+    <vendor>ArvanAi</vendor>
+
+    <description><![CDATA[
+    <p>Chat with <b>ArvanCloud AI</b> models inside IntelliJ-based IDEs, in English or Persian (Farsi), with full RTL / bidi support.</p>
+    <ul>
+      <li>Talks directly to the ArvanCloud AI chat-completions API with your own API key (kept in the IDE's secure storage)</li>
+      <li>Streaming replies, multiple chats, and a configurable model</li>
+      <li>English / Persian UI (switch from the chat toolbar); write in either language and get the reply in the same one</li>
+      <li>Per-paragraph LTR/RTL detection, so mixed Persian/English text never breaks; bundled Vazirmatn font</li>
+      <li>Code blocks stay left-to-right, with Copy and Insert-at-caret buttons</li>
+      <li>Project rules and skills from the <code>.arvanai/</code> folder; skills are available as slash commands</li>
+      <li>One-click import of existing rules and skills from other AI tools' folders into <code>.arvanai/</code></li>
+      <li>Current file and selection are shared with the model automatically</li>
+      <li>@-mention project files with autocomplete; send or explain the editor selection</li>
+    </ul>
+    <p dir="rtl">گفتگو با مدل‌های هوش مصنوعی آروان‌کلود داخل IDE با پشتیبانی کامل از زبان فارسی و راست‌به‌چپ؛ قوانین و اسکیل‌های پروژه از پوشهٔ <code>.arvanai/</code>.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <!-- Since 2026.x JCEF lives in a separate bundled plugin; without this dependency
+         JBCefApp/JBCefBrowser are not visible to our class loader. Optional so older IDEs
+         (where JCEF is part of the core) still load the plugin. -->
+    <depends optional="true" config-file="arvanai-jcef.xml">com.intellij.modules.jcef</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="ArvanAi"
+                    anchor="right"
+                    icon="/icons/arvanai.svg"
+                    factoryClass="ir.arvanai.ui.ChatToolWindowFactory"/>
+
+        <applicationService serviceImplementation="ir.arvanai.settings.ArvanAiSettings"/>
+
+        <applicationConfigurable parentId="tools"
+                                 instance="ir.arvanai.settings.ArvanAiConfigurable"
+                                 id="ir.arvanai.settings"
+                                 displayName="ArvanAi"/>
+
+        <notificationGroup id="ArvanAi" displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <group id="ArvanAi.EditorGroup" text="ArvanAi" popup="true" icon="/icons/arvanai.svg">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <action id="ArvanAi.SendSelection"
+                    class="ir.arvanai.actions.SendSelectionAction"
+                    text="Insert File Reference in Chat (@File#L1-99)"
+                    description="Insert a reference to the current file / selected lines into the ArvanAi chat input">
+                <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+                <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift K"/>
+            </action>
+            <action id="ArvanAi.Explain"
+                    class="ir.arvanai.actions.ExplainSelectionAction"
+                    text="Explain This Code"
+                    description="Ask the assistant to explain the selected code"/>
+            <action id="ArvanAi.Review"
+                    class="ir.arvanai.actions.ReviewSelectionAction"
+                    text="Review and Suggest Improvements"
+                    description="Ask the assistant to review the selected code"/>
+        </group>
+        <action id="ArvanAi.Open"
+                class="ir.arvanai.actions.OpenChatAction"
+                text="ArvanAi: Open Chat"
+                icon="/icons/arvanai.svg"
+                description="Open the ArvanAi chat">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift L"/>
+        </action>
+        <action id="ArvanAi.ImportInstructions"
+                class="ir.arvanai.actions.ImportInstructionsAction"
+                text="ArvanAi: Import Rules &amp; Skills"
+                description="Move rules and skills from other AI tools' folders into .arvanai/">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
