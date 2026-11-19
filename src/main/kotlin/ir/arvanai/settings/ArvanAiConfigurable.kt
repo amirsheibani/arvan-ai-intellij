@@ -160,13 +160,27 @@ class ArvanAiConfigurable : BoundConfigurable("ArvanAi") {
         }
         group(tr("Code Graph (graphify, optional)", "گراف کد (graphify، اختیاری)")) {
             row {
+                checkBox(tr("Use the code graph in chat (same as the graphify button in the chat toolbar)", "استفاده از گراف کد در چت (همان دکمهٔ graphify در نوار ابزار چت)"))
+                    .bindSelected(s::useGraphify)
+            }
+            row {
+                checkBox(tr("Keep the graph in the project's graphify-out/ folder", "ذخیرهٔ گراف در پوشهٔ graphify-out/ پروژه"))
+                    .bindSelected(s::graphInProject)
+                    .comment(
+                        tr(
+                            "Off (default): the graph lives in the IDE's own folder. On: it is written to graphify-out/ in the project, so you can also use it from a terminal (graphify query). If your own graphify or another tool uses that folder, the graph is shared. Consider adding graphify-out/ to .gitignore. After switching, the graph is built in the new place the next time it is needed.",
+                            "خاموش (پیش‌فرض): گراف در پوشهٔ مخصوص IDE است. روشن: گراف در graphify-out/ پروژه نوشته می‌شود تا از ترمینال هم قابل استفاده باشد (graphify query). اگر graphify خودتان یا ابزار دیگری هم از این پوشه استفاده کند، گراف مشترک می‌شود. بهتر است graphify-out/ را به ‎.gitignore اضافه کنید. بعد از تغییر این گزینه، گراف دفعهٔ بعد که لازم شود در مکان جدید ساخته می‌شود.",
+                        )
+                    )
+            }
+            row {
                 button(tr("Build Code Graph for Current Project", "ساخت گراف کد برای پروژهٔ فعلی")) {
                     val project = ProjectUtil.getActiveProject() ?: ProjectManager.getInstance().openProjects.firstOrNull()
                     if (project != null) GraphifySetup.run(project)
                 }.comment(
                     tr(
-                        "The chat agent already finds symbols, references and file relations with the IDE's index. graphify builds a code graph that is used when you ask with /graphify <question>. graphify and the graph live in the IDE's own folder (installed with uv on first use, needs internet); nothing in the project or in other tools is changed.",
-                        "ایجنت چت خودش با index خود IDE نمادها، ارجاع‌ها و رابطهٔ فایل‌ها را پیدا می‌کند. graphify یک گراف کد می‌سازد که با ‎/graphify <سؤال> استفاده می‌شود. خود graphify و گراف در پوشهٔ مخصوص IDE نگه‌داری می‌شوند (بار اول با uv نصب می‌شود و اینترنت لازم است). در پروژه و ابزارهای دیگر چیزی تغییر نمی‌کند.",
+                        "The chat agent already finds symbols, references and file relations with the IDE's index. graphify builds a code graph that is used by the assistant while the graphify option is on. graphify lives in the IDE's own folder (installed with uv on first use, needs internet); other tools are not changed.",
+                        "ایجنت چت خودش با index خود IDE نمادها، ارجاع‌ها و رابطهٔ فایل‌ها را پیدا می‌کند. graphify یک گراف کد می‌سازد که تا وقتی گزینهٔ graphify روشن است دستیار از آن استفاده می‌کند. خود graphify در پوشهٔ مخصوص IDE نگه‌داری می‌شود (بار اول با uv نصب می‌شود و اینترنت لازم است). ابزارهای دیگر تغییری نمی‌کنند.",
                     )
                 )
             }

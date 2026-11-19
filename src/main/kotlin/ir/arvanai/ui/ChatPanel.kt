@@ -107,9 +107,17 @@ class ChatPanel(private val project: Project) : Disposable {
         @Volatile
         var plan = false
 
-        /** The user asked for graphify (`/graphify <question>`): the graphify tool is offered for this turn. */
+        /** The graphify tool is offered for this turn (the button is on, or the user sent `/graphify <question>`). */
         @Volatile
         var graphify = false
+
+        /** [graphify] came from the explicit `/graphify <question>` command, not from the toolbar button. */
+        @Volatile
+        var graphifyExplicit = false
+
+        /** At least one edit_file / write_file call succeeded in this turn. */
+        @Volatile
+        var appliedEdit = false
     }
 
     private val gson = Gson()
@@ -133,6 +141,8 @@ class ChatPanel(private val project: Project) : Disposable {
 
     private val sessions = ConcurrentHashMap<String, ChatSession>()
     private val turns = ConcurrentHashMap<String, Turn>()
+    /** Chats already told that a message went out without graphify because the graph is not ready. */
+    private val graphNoticed: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val tracker = SelectionTracker.getInstance(project)
     private val agentTools by lazy { AgentTools(project) }
 
@@ -289,6 +299,22 @@ class ChatPanel(private val project: Project) : Disposable {
                 post("models", reply)
             }
             "setAutoFollow" -> ArvanAiSettings.get().autoFollow = bool("value", true)
+            "setGraphify" -> {
+                val on = bool("value", false)
+                ArvanAiSettings.get().useGraphify = on
+                PluginLog.info("ui", "graphify: $on")
+                if (on) pooled {
+                    if (!GraphifySetup.hasGraph(project)) {
+                        GraphifySetup.run(project)
+                        if (msg.get("chat")?.isJsonPrimitive == true) {
+                            chatNotice(chat, I18n.tr(
+                                "Building the code graph in the background. graphify will be used once it is ready.",
+                                "گراف کد در پس‌زمینه ساخته می‌شود. بعد از آماده شدن، graphify استفاده می‌شود.",
+                            ))
+                        }
+                    }
+                }
+            }
             "setLanguage" -> {
                 ArvanAiSettings.get().language = if (str("value") == "fa") "fa" else "en"
                 PluginLog.info("ui", "language: " + ArvanAiSettings.get().language)
@@ -365,6 +391,14 @@ class ChatPanel(private val project: Project) : Disposable {
                     graphifyBuildCommand(turn)
                     return@pooled
                 }
+                if (!s.useGraphify) {
+                    finishTurn(turn) {
+                        chatNotice(chat, I18n.tr("graphify is off. Turn on the graphify button in the chat toolbar to use the code graph.",
+                            "graphify خاموش است. برای استفاده از گراف کد، دکمهٔ graphify را در نوار ابزار چت روشن کنید."))
+                        post("done", chatJson(chat))
+                    }
+                    return@pooled
+                }
                 if (!s.agentTools || toolsUnsupported) {
                     finishTurn(turn) {
                         chatNotice(chat, I18n.tr("/graphify needs the agent tools (Settings › Tools › ArvanAi › Chat Agent) and a model that supports tools.",
@@ -382,7 +416,18 @@ class ChatPanel(private val project: Project) : Disposable {
                     return@pooled
                 }
                 turn.graphify = true
+                turn.graphifyExplicit = true
                 input = question
+            } else if (s.useGraphify && s.agentTools && !toolsUnsupported) {
+                if (GraphifySetup.hasGraph(project)) {
+                    turn.graphify = true
+                } else {
+                    if (!GraphifySetup.isBuilding) GraphifySetup.run(project)
+                    if (graphNoticed.add(chat)) chatNotice(chat, I18n.tr(
+                        "The code graph is not ready yet, so this message is sent without graphify.",
+                        "گراف کد هنوز آماده نیست، پس این پیام بدون graphify ارسال می‌شود.",
+                    ))
+                }
             }
             // "/skill args" becomes the skill's instructions; other text keeps the IDE context.
             var text = input
@@ -424,7 +469,7 @@ class ChatPanel(private val project: Project) : Disposable {
             if (turn.finished.get()) return
             agentTools.definitions(turn.plan, turn.graphify).also { defs -> if (s.mcpEnabled) mcp.definitions(readOnlyOnly = turn.plan).forEach { defs.add(it) } }
         } else null
-        val system = buildSystemPrompt(useTools, turn.plan, turn.graphify)
+        val system = buildSystemPrompt(useTools, turn.plan, turn.graphify, turn.graphifyExplicit)
         if (s.autoCompact) maybeCompact(turn, conv, system)
         if (turn.finished.get()) return
         val messages = conv.snapshot(system)
@@ -654,7 +699,7 @@ class ChatPanel(private val project: Project) : Disposable {
             }
         }
         val r = try {
-            p.run(turn.run)
+            p.run(turn.run).also { if (it.ok && (call.name == "edit_file" || call.name == "write_file")) turn.appliedEdit = true }
         } catch (e: Throwable) {
             PluginLog.warn("agent", "${call.name} failed: ${e.javaClass.simpleName}")
             AgentTools.Result(false, "Error: ${e.message ?: e.javaClass.simpleName}", e.message ?: e.javaClass.simpleName)
@@ -778,8 +823,8 @@ class ChatPanel(private val project: Project) : Disposable {
         GraphifySetup.run(project)
         finishTurn(turn) {
             chatNotice(chat, I18n.tr(
-                "Building the code graph in the background (progress in the IDE status bar). When it is done, ask with /graphify <question>.",
-                "ساخت گراف کد در پس‌زمینه شروع شد (پیشرفت در نوار وضعیت IDE). بعد از پایان، با /graphify <سؤال> بپرسید.",
+                "Building the code graph in the background (progress in the IDE status bar). When it is done, turn on the graphify button in the chat toolbar.",
+                "ساخت گراف کد در پس‌زمینه شروع شد (پیشرفت در نوار وضعیت IDE). بعد از پایان، دکمهٔ graphify را در نوار ابزار چت روشن کنید.",
             ))
             post("done", chatJson(chat))
         }
@@ -874,6 +919,8 @@ class ChatPanel(private val project: Project) : Disposable {
             block()
         } finally {
             turns.remove(turn.chat, turn)
+            // Keep the code graph fresh after edits while graphify is on.
+            if (turn.appliedEdit && ArvanAiSettings.get().useGraphify && !GraphifySetup.isBuilding) GraphifySetup.run(project, quiet = true)
             post("busy", chatJson(turn.chat).apply { addProperty("busy", false) })
             pooled { saveSession(turn.chat) }
         }
@@ -1021,7 +1068,7 @@ class ChatPanel(private val project: Project) : Disposable {
     }
 
     /** Agent prompt + language prompt + project rules + the user's own extra prompt. Built fresh for every request. */
-    private fun buildSystemPrompt(useTools: Boolean, plan: Boolean = false, graphify: Boolean = false): String {
+    private fun buildSystemPrompt(useTools: Boolean, plan: Boolean = false, graphify: Boolean = false, graphifyExplicit: Boolean = false): String {
         val s = ArvanAiSettings.get()
         return listOf(
             if (useTools) Prompts.agentPrompt(
@@ -1032,7 +1079,7 @@ class ChatPanel(private val project: Project) : Disposable {
                 canRun = !plan,
             ) else "",
             if (useTools && plan) Prompts.PLAN_MODE else "",
-            if (useTools && graphify) Prompts.GRAPHIFY_MODE else "",
+            if (useTools && graphify) (if (graphifyExplicit) Prompts.GRAPHIFY_MODE else Prompts.GRAPHIFY_ON) else "",
             if (s.matchReplyLanguage) Prompts.languagePrompt(I18n.lang) else "",
             ProjectInstructions.systemPrompt(project.basePath),
             s.systemPrompt.trim(),
@@ -1239,6 +1286,7 @@ class ChatPanel(private val project: Project) : Disposable {
             add("models", gson.toJsonTree(s.knownModels.toList()))
             addProperty("shareSelection", s.shareSelection)
             addProperty("autoFollow", s.autoFollow)
+            addProperty("useGraphify", s.useGraphify)
             addProperty("language", I18n.lang)
         })
     }

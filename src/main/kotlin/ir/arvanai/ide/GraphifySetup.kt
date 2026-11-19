@@ -15,18 +15,20 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.SystemInfo
 import ir.arvanai.I18n.tr
 import ir.arvanai.PluginLog
+import ir.arvanai.settings.ArvanAiSettings
 import java.io.File
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Optional code graph with graphify, used only when the user asks for it:
+ * Optional code graph with graphify, used only when the user turns it on:
  * - `/graphify` in the chat or the Settings button builds or refreshes the graph (AST only, no LLM);
- * - `/graphify <question>` gives the agent the `graphify` tool ([query]) for that message.
+ * - while the graphify button in the chat toolbar is on, the agent gets the `graphify` tool ([query]) on every message.
  *
  * Fully isolated from other tools: graphify is installed into the plugin's own folder (not the user's
- * `uv tool` set), the graph is written to the IDE system folder (never `graphify-out/` in the project, which
- * other tools may own), and nothing is written to the project, AGENTS.md or `.git/hooks`.
+ * `uv tool` set), the graph is written to the IDE system folder (not `graphify-out/` in the project, which
+ * other tools may own, unless the user opts in with `graphInProject`), and nothing else is written to the
+ * project, AGENTS.md or `.git/hooks`.
  * A graphify the user installed themselves is never used or changed.
  */
 object GraphifySetup {
@@ -37,6 +39,9 @@ object GraphifySetup {
 
     private val running = AtomicBoolean(false)
 
+    /** True while a graph build is running. */
+    val isBuilding: Boolean get() = running.get()
+
     // ---------------------------------------------------------------- private folders
 
     private fun home(): File = File(PathManager.getSystemPath(), "arvanai")
@@ -45,8 +50,15 @@ object GraphifySetup {
     private fun toolsDir() = File(home(), "tools")
     private fun binDir() = File(toolsDir(), "bin")
 
-    /** The graph of [project], outside the project folder. */
-    fun graphDir(project: Project): File = File(home(), "graphify/" + project.locationHash)
+    /**
+     * The graph of [project]: outside the project folder by default, or the project's own `graphify-out/`
+     * when the user turned on [ArvanAiSettings.State.graphInProject].
+     */
+    fun graphDir(project: Project): File {
+        val base = project.basePath
+        if (ArvanAiSettings.get().graphInProject && base != null) return File(base, "graphify-out")
+        return File(home(), "graphify/" + project.locationHash)
+    }
 
     fun hasGraph(project: Project) = File(graphDir(project), "graph.json").isFile
 
@@ -116,21 +128,24 @@ object GraphifySetup {
 
     // ---------------------------------------------------------------- build
 
-    /** Builds (or rebuilds) the graph in a background task with progress. */
-    fun run(project: Project) {
+    /**
+     * Builds (or rebuilds) the graph in a background task with progress.
+     * [quiet]: automatic refresh, so no "already building" and no "graph is ready" notification (errors still notify).
+     */
+    fun run(project: Project, quiet: Boolean = false) {
         if (project.basePath == null) return
-        ApplicationManager.getApplication().invokeLater({ startTask(project) }, project.disposed)
+        ApplicationManager.getApplication().invokeLater({ startTask(project, quiet) }, project.disposed)
     }
 
-    private fun startTask(project: Project) {
+    private fun startTask(project: Project, quiet: Boolean) {
         if (!running.compareAndSet(false, true)) {
-            notify(project, tr("The code graph is already being built.", "گراف کد در حال ساخته شدن است."), NotificationType.INFORMATION)
+            if (!quiet) notify(project, tr("The code graph is already being built.", "گراف کد در حال ساخته شدن است."), NotificationType.INFORMATION)
             return
         }
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, tr("Building the code graph (graphify)", "ساخت گراف کد (graphify)"), true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    build(project, indicator)
+                    build(project, indicator, quiet)
                 } catch (e: Exception) {
                     PluginLog.warn("graphify", "Build failed: ${e.javaClass.simpleName}")
                     notify(project, tr("Building the code graph failed. See the Log tab.", "ساخت گراف کد ناموفق بود. تب Log را ببینید."), NotificationType.ERROR)
@@ -143,7 +158,7 @@ object GraphifySetup {
         })
     }
 
-    private fun build(project: Project, indicator: ProgressIndicator) {
+    private fun build(project: Project, indicator: ProgressIndicator, quiet: Boolean) {
         val base = File(project.basePath ?: return)
 
         indicator.text = tr("Looking for graphify…", "جست‌وجوی graphify…")
@@ -176,7 +191,13 @@ object GraphifySetup {
             return fail(project, tr("Building the code graph failed.", "ساخت گراف کد ناموفق بود."))
         }
         PluginLog.info("graphify", "Code graph built")
-        notify(project, tr("The code graph is ready. Ask with /graphify <question>.", "گراف کد آماده است. با ‎/graphify <سؤال> بپرسید."), NotificationType.INFORMATION)
+        if (!quiet) {
+            notify(
+                project,
+                tr("The code graph is ready. The graphify button in the chat uses it.", "گراف کد آماده است. دکمهٔ graphify در چت از آن استفاده می‌کند."),
+                NotificationType.INFORMATION,
+            )
+        }
     }
 
     /** Runs a command in the isolated environment; killed when the task is cancelled or times out. */

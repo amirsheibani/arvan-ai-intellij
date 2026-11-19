@@ -72,12 +72,12 @@ class AgentTools(private val project: Project) {
 
     /**
      * Tool definitions; in [planMode] only read-only tools plus exit_plan_mode.
-     * [graphify]: the user asked for graphify (`/graphify <question>`), so the `graphify` tool is offered too.
+     * [graphify]: the user turned graphify on (chat toolbar button) or asked with `/graphify <question>`, so the `graphify` tool is offered too.
      */
     fun definitions(planMode: Boolean, graphify: Boolean = false): JsonArray = JsonArray().apply {
         if (graphify) {
-            add(fn("graphify", "Query the project's graphify knowledge graph, which the user asked you to use " +
-                    "for this message. mode \"query\": a question in natural language; \"explain\": one concept or symbol; " +
+            add(fn("graphify", "Query the project's graphify knowledge graph (enabled by the user). " +
+                    "mode \"query\": a question in natural language; \"explain\": one concept or symbol; " +
                     "\"path\": how two concepts are connected (text = from, to = to). Returns a scoped subgraph.",
                 props = mapOf(
                     "mode" to JsonObject().apply {

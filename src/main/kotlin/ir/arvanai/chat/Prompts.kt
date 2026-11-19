@@ -62,7 +62,14 @@ object Prompts {
             "When you have a complete, concrete plan (files to change, the changes, steps, how to verify), call " +
             "exit_plan_mode with it. Do not start implementing until the user approves."
 
-    /** Added to the system prompt when the user sent `/graphify <question>`. */
+    /** Added to the system prompt on every message while the graphify button is on. */
+    const val GRAPHIFY_ON =
+        "# graphify is on\n" +
+            "The project's graphify knowledge graph is available. For questions about the codebase (its structure, where " +
+            "something is, how parts connect) start with the graphify tool: mode query, explain or path. Then use the " +
+            "other tools to confirm details and to read or edit the exact code."
+
+    /** Added to the system prompt when the user sent the explicit `/graphify <question>`. */
     const val GRAPHIFY_MODE =
         "# graphify requested\n" +
             "For this message the user asked you to use the project's graphify knowledge graph. Start with the " +

@@ -24,6 +24,10 @@ class ArvanAiSettings : PersistentStateComponent<ArvanAiSettings.State> {
         var shareSelection: Boolean = true
         /** Keep the chat scrolled to the bottom while the assistant writes. */
         var autoFollow: Boolean = true
+        /** The agent uses the project's graphify code graph on every message (the graphify button in the chat toolbar). */
+        var useGraphify: Boolean = false
+        /** Keep the graph in the project's `graphify-out/` (shared with a graphify CLI) instead of the IDE system folder. */
+        var graphInProject: Boolean = false
 
         /** UI language: "en" (default) or "fa". */
         var language: String = "en"

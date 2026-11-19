@@ -14,6 +14,7 @@
     modelsError: "",
     shareSelectionSetting: true,
     autoFollow: true,
+    useGraphify: false,
     ctx: null,
     hasKey: null,
     commands: null,
@@ -304,6 +305,26 @@
     if (!c || c.busy) return;
     c.plan = !c.plan;
     renderMode();
+  }
+
+  // ==================================================================== graphify toggle
+  function renderGraphify() {
+    const b = $("graphifyChip");
+    if (!b) return;
+    const on = !!G.useGraphify;
+    b.classList.toggle("on", on);
+    b.textContent = on ? "◆ graphify" : "◇ graphify";
+    b.title = on
+      ? tr("graphify on: the assistant starts from the project's code graph. Click to turn off.",
+        "graphify روشن است: دستیار از گراف کد پروژه شروع می‌کند. برای خاموش کردن کلیک کنید.")
+      : tr("graphify off: the code graph is not used. Click to turn on (builds the graph the first time).",
+        "graphify خاموش است: از گراف کد استفاده نمی‌شود. برای روشن کردن کلیک کنید (بار اول گراف ساخته می‌شود).");
+  }
+  function toggleGraphify() {
+    G.useGraphify = !G.useGraphify;
+    renderGraphify();
+    const c = chat();
+    toIde(c ? { type: "setGraphify", value: G.useGraphify, chat: c.id } : { type: "setGraphify", value: G.useGraphify });
   }
 
   // ==================================================================== todo list
@@ -1260,6 +1281,8 @@
           if (Array.isArray(p.models)) G.models = p.models;
           if (p.shareSelection !== undefined) G.shareSelectionSetting = p.shareSelection;
           if (p.autoFollow !== undefined) G.autoFollow = p.autoFollow;
+          if (p.useGraphify !== undefined) G.useGraphify = p.useGraphify;
+          renderGraphify();
           document.body.classList.toggle("light", !p.dark);
           renderInfo();
           renderCtx();
@@ -1537,6 +1560,7 @@
     autoGrow();
     document.querySelectorAll(".welcome-wrap").forEach(fillWelcome);
     setModel(G.model, false);
+    renderGraphify();
     // Views that build their skeleton once are rebuilt in the new language on the next render.
     skillsBuilt = logBuilt = false;
     ["view-skills", "view-log"].forEach((id) => ($(id).innerHTML = ""));
@@ -1594,6 +1618,7 @@
   $("searchPrev").addEventListener("click", () => findNext(true));
   $("searchClose").addEventListener("click", () => $("searchBar").classList.add("hidden"));
   $("modeChip").addEventListener("click", togglePlan);
+  $("graphifyChip").addEventListener("click", toggleGraphify);
   $("ctxChip").addEventListener("click", () => {
     const c = chat();
     if (c) c.shareCtx = !c.shareCtx;

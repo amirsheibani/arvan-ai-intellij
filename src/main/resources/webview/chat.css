@@ -447,4 +447,5 @@ button.send .ico, button.stop .ico { width: 19px; height: 19px; }
 
 /* plan mode chip + plan approval */
 .chip.mode.on { color: var(--warn); font-weight: 700; }
+.chip.graph.on { color: var(--accent); font-weight: 700; }
 .tool .approval .plan { direction: initial; text-align: start; margin: 0 0 6px; padding: 4px 8px; background: var(--code-bg); border-radius: 6px; max-height: 420px; overflow: auto; font-family: var(--font); }
