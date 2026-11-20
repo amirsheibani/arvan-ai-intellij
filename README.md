@@ -1,5 +1,7 @@
 # ArvanAi — دستیار و ایجنت هوش مصنوعی ابرآروان داخل IDEهای JetBrains
 
+> **English:** AI coding agent and chat for JetBrains IDEs with full Persian/RTL support, powered by ArvanCloud AI. [Read the English README →](README.en.md)
+
 یک پنل گفتگو و ایجنت برنامه‌نویسی که با مدل‌های **هوش مصنوعی ابرآروان** (`api.arvancloudai.ir`) کار می‌کند. داخل IntelliJ IDEA، PyCharm، WebStorm، Android Studio و بقیهٔ IDEهای JetBrains اجرا می‌شود و متن فارسی، راست‌به‌چپ و متن‌های ترکیبی فارسی/انگلیسی را درست نشان می‌دهد.
 
 ![پنل گفتگوی ArvanAi](screen.png)
