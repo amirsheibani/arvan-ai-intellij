@@ -8,5 +8,6 @@
 | [chat-agent.md](chat-agent.md) | ایجنت چت: ابزارها، پیمایش کد با index IDE، graphify، حالت طرح، خلاصه‌سازی، ذخیرهٔ گفتگو، MCP، استقلال از ابزارهای دیگر |
 | [arvan-api.md](arvan-api.md) | ارتباط با API هوش مصنوعی ابرآروان: درخواست، استریم، خطاها، فهرست مدل‌ها |
 | [instructions-import.md](instructions-import.md) | قوانین و اسکیل‌های `.arvanai/` و دکمهٔ کپی |
+| [user-message-actions.md](user-message-actions.md) | دکمه‌های کپی و اجرای مجدد روی پیام‌های کاربر، استایل تب‌های چت و چشمک انتظار تأیید |
 
 </div>
